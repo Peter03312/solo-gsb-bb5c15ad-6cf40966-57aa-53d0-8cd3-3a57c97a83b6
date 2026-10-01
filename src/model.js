@@ -312,6 +312,215 @@ function mergeOrder({ baseline, latest, draft, surviving, draftMoved }) {
 }
 
 // ---------------------------------------------------------------------------
+// 草案间移植（纯函数）
+// 把来源草案 source 相对共同基线 baseline 的、按条款标识 keys 选中的改动，
+// 应用到目标草案 target 的当前状态上。选中某标识即移植其全部改动面
+// （新增/删除/标题正文/位置移动/出站引用）；不会自动移入引用目标条款。
+// 目标对同一标识已有不同改动（含删除、同标识新增、移动或引用变化）时逐条
+// 冲突；已相同的改动收敛。移植新造成悬空引用时整次拒绝。
+// 返回：
+//   { ok: true, merged, mergedMoved, applied, converged }
+//   { ok: false, reason: 'no-source-change', keys }   来源对这些标识相对基线无改动
+//   { ok: false, reason: 'no-changes', converged }    所选改动在目标中已全部相同
+//   { ok: false, reason: 'conflict', conflicts }      目标对同标识已有不同改动
+//   { ok: false, reason: 'dangling', dangling }       移植新造成悬空引用
+// ---------------------------------------------------------------------------
+function planTransplant({ baseline, source, target, sourceMoved = new Set(), targetMoved = new Set(), keys = [] }) {
+  const selected = [...new Set(keys)];
+  const sTouched = touchedClauses(baseline, source, sourceMoved);
+  const tTouched = touchedClauses(baseline, target, targetMoved);
+
+  const noChange = selected.filter((k) => !sTouched.has(k));
+  if (noChange.length) return { ok: false, reason: 'no-source-change', keys: noChange };
+
+  // 合并起点 = 目标当前状态（深拷贝；来源与目标草案本身不被修改）
+  const mergedClauses = new Map([...target.clauses].map(([k, c]) => [k, { ...c }]));
+  let mergedEdges = target.edges.map((e) => ({ ...e }));
+  const mergedMoved = new Set(targetMoved);
+  const replanted = new Set(); // 因移植需按来源锚点重新定位的条款
+
+  const applyBody = (key) => mergedClauses.set(key, { ...source.clauses.get(key) });
+  const applyPosition = (key) => {
+    replanted.add(key);
+    mergedMoved.add(key);
+  };
+  // 出站引用整体替换为来源侧该条款的出边（删除条款时同样以来源侧为准：来源已清理则清理）
+  const applyEdges = (key) => {
+    mergedEdges = mergedEdges
+      .filter((e) => e.source !== key)
+      .concat(edgesOf(source, key).map((e) => ({ ...e })));
+  };
+  const applyDelete = (key) => {
+    mergedClauses.delete(key);
+    mergedMoved.delete(key);
+    applyEdges(key);
+  };
+  const applyAdded = (key) => {
+    mergedClauses.set(key, { ...source.clauses.get(key) });
+    applyEdges(key);
+  };
+  const applyChange = (key, ch) => {
+    if (ch.deleted) return applyDelete(key);
+    if (ch.added) return applyAdded(key);
+    if (ch.body) applyBody(key);
+    if (ch.position) applyPosition(key);
+    if (ch.edges) applyEdges(key);
+  };
+
+  const conflicts = [];
+  const applied = [];
+  const converged = [];
+
+  for (const key of selected) {
+    const sCh = sTouched.get(key);
+    const tCh = tTouched.get(key);
+
+    if (!tCh) {
+      // 目标未改动该标识：整体应用来源改动
+      applyChange(key, sCh);
+      applied.push({ key, kinds: changeKinds(sCh) });
+      continue;
+    }
+
+    // 目标对同一标识也有改动：逐面对比，相同收敛、不同冲突
+    const keyApplied = [];
+    const keyConverged = [];
+    if (sCh.deleted || tCh.deleted) {
+      if (sCh.deleted && tCh.deleted) {
+        keyConverged.push('deleted'); // 双方都删除：收敛
+      } else if (sCh.deleted) {
+        conflicts.push({
+          key,
+          kind: 'delete-modify',
+          message: `来源草案删除了条款「${key}」，但目标草案对该条款已有不同改动（${describeChange(tCh)}）`,
+        });
+      } else {
+        conflicts.push({
+          key,
+          kind: 'modify-delete',
+          message: `来源草案改动了条款「${key}」（${describeChange(sCh)}），但目标草案已删除该条款`,
+        });
+      }
+    } else if (sCh.added) {
+      // 标识不在基线中：目标有改动即目标也新增了同标识条款
+      const sC = source.clauses.get(key);
+      const tC = target.clauses.get(key);
+      const sameContent = sC.title === tC.title && sC.body === tC.body;
+      const sameEdges = edgeSetsEqual(edgesOf(source, key), edgesOf(target, key));
+      if (sameContent && sameEdges) {
+        keyConverged.push('added');
+      } else {
+        conflicts.push({
+          key,
+          kind: 'add-add',
+          message: `来源与目标都新增了条款「${key}」，但标题、正文或出站引用不一致`,
+        });
+      }
+    } else {
+      if (sCh.body) {
+        if (!tCh.body) {
+          keyApplied.push('body');
+        } else {
+          const sC = source.clauses.get(key);
+          const tC = target.clauses.get(key);
+          if (sC.title === tC.title && sC.body === tC.body) keyConverged.push('body');
+          else conflicts.push({ key, kind: 'modify-modify', message: `条款「${key}」的标题/正文被来源与目标改成了不同内容` });
+        }
+      }
+      if (sCh.position) {
+        if (!tCh.position) keyApplied.push('position');
+        else if (samePlacement(source, target, key)) keyConverged.push('position');
+        else conflicts.push({ key, kind: 'move-move', message: `条款「${key}」被来源与目标移动到了不同位置` });
+      }
+      if (sCh.edges) {
+        if (!tCh.edges) keyApplied.push('edges');
+        else if (edgeSetsEqual(edgesOf(source, key), edgesOf(target, key))) keyConverged.push('edges');
+        else conflicts.push({ key, kind: 'refs-conflict', message: `条款「${key}」的出站引用被来源与目标改成了不同集合` });
+      }
+    }
+
+    if (keyConverged.length) converged.push({ key, kinds: keyConverged });
+    if (keyApplied.length) {
+      applied.push({ key, kinds: keyApplied });
+      // 无冲突的改动面先行应用；若本条款存在冲突面，最终整体失败、合并结果被丢弃
+      if (keyApplied.includes('body')) applyBody(key);
+      if (keyApplied.includes('position')) applyPosition(key);
+      if (keyApplied.includes('edges')) applyEdges(key);
+    }
+  }
+
+  if (conflicts.length) return { ok: false, reason: 'conflict', conflicts };
+  if (!applied.length) return { ok: false, reason: 'no-changes', converged };
+
+  // 条款顺序：以目标当前顺序为底，移植带来的新增/移动条款按来源锚点重定位
+  const order = mergeOrder({ baseline, latest: target, draft: source, surviving: mergedClauses, draftMoved: replanted });
+  for (const k of [...mergedMoved]) if (!mergedClauses.has(k)) mergedMoved.delete(k);
+  const merged = { order, clauses: mergedClauses, edges: mergedEdges };
+
+  // 悬空引用：仅拦截“移植新造成”的悬空（目标既有的悬空暂存不受影响）
+  const preExisting = new Set(danglingRefs(target).map(danglingKey));
+  const dangling = danglingRefs(merged).filter((d) => !preExisting.has(danglingKey(d)));
+  if (dangling.length) {
+    return {
+      ok: false,
+      reason: 'dangling',
+      dangling: dangling.map((d) => ({
+        ...d,
+        message: `引用 ${d.source} → ${d.target}${d.label ? `（${d.label}）` : ''} 在移植后${
+          d.missing.includes('target') ? '目标' : ''
+        }${d.missing.length === 2 ? '与来源均' : ''}${d.missing.includes('source') && d.missing.length < 2 ? '来源' : ''}不存在（移植不会自动移入引用目标条款，可将相关条款一并选择后重试）`,
+      })),
+    };
+  }
+
+  return { ok: true, merged, mergedMoved, applied, converged };
+}
+
+function changeKinds(ch) {
+  const kinds = [];
+  if (ch.added) kinds.push('added');
+  if (ch.deleted) kinds.push('deleted');
+  if (ch.body) kinds.push('body');
+  if (ch.position) kinds.push('position');
+  if (ch.edges) kinds.push('edges');
+  return kinds;
+}
+
+function describeChange(ch) {
+  const parts = [];
+  if (ch.added) parts.push('同标识新增');
+  if (ch.deleted) parts.push('删除');
+  if (ch.body) parts.push('标题/正文修改');
+  if (ch.position) parts.push('移动');
+  if (ch.edges) parts.push('出站引用变化');
+  return parts.join('、');
+}
+
+// 位置收敛判定：两份草案中该条款的直接前驱相同即视为同一落点
+function samePlacement(a, b, key) {
+  const pred = (state) => {
+    const i = state.order.indexOf(key);
+    return i > 0 ? state.order[i - 1] : null;
+  };
+  return pred(a) === pred(b);
+}
+
+function danglingRefs(state) {
+  const out = [];
+  for (const e of state.edges) {
+    const missing = [];
+    if (!state.clauses.has(e.source)) missing.push('source');
+    if (!state.clauses.has(e.target)) missing.push('target');
+    if (missing.length) out.push({ source: e.source, target: e.target, label: e.label || '', missing });
+  }
+  return out;
+}
+
+function danglingKey(d) {
+  return `${d.source}->${d.target}#${d.label || ''}`;
+}
+
+// ---------------------------------------------------------------------------
 // 草案静态校验：结构问题（可暂存，不可发布）
 // ---------------------------------------------------------------------------
 function validateState(state) {
@@ -701,6 +910,8 @@ module.exports = {
   movedKeys,
   touchedClauses,
   replayDraft,
+  planTransplant,
+  mergeOrder,
   validateState,
   hasBlockingIssues,
   diffStates,

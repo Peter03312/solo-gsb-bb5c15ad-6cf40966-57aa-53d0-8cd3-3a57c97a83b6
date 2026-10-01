@@ -5,6 +5,7 @@ const {
   buildState,
   touchedClauses,
   replayDraft,
+  planTransplant,
   validateState,
   hasBlockingIssues,
   diffStates,
@@ -500,6 +501,192 @@ test('referenceImpact：删除被引用条款且入边一并清理时，旧入�
   assert.ok(c, '变化前引用 B 的 C 仍作为受影响条款展示');
   assert.strictEqual(c.after, null);
   assert.strictEqual(c.status, 'broken-after');
+});
+
+// ---------------------------------------------------------------------------
+// 草案间移植 planTransplant
+// ---------------------------------------------------------------------------
+function transplantFixture() {
+  // 共同基线：A B C，引用 B->A
+  const base = S(
+    ['A', 'B', 'C'],
+    [['A', '总则', 'AAA'], ['B', '会员', 'BBB'], ['C', '附则', 'CCC']],
+    [{ source: 'B', target: 'A', label: '参见' }],
+  );
+  // 来源：改 A 正文、移动 C 到 A 后、新增 D（含 D->A）
+  const source = S(
+    ['A', 'C', 'B', 'D'],
+    [['A', '总则', 'AAA-源'], ['C', '附则', 'CCC'], ['B', '会员', 'BBB'], ['D', '新条', 'DDD']],
+    [
+      { source: 'B', target: 'A', label: '参见' },
+      { source: 'D', target: 'A', label: '依据' },
+    ],
+  );
+  return { base, source };
+}
+
+test('planTransplant：目标未改动的条款整体应用来源改动（修改/移动/新增及其出站引用）', () => {
+  const { base, source } = transplantFixture();
+  const target = S(
+    ['A', 'B', 'C'],
+    [['A', '总则', 'AAA'], ['B', '会员', 'BBB-目'], ['C', '附则', 'CCC']],
+    [{ source: 'B', target: 'A', label: '参见' }],
+  );
+  const r = planTransplant({
+    baseline: base, source, target,
+    sourceMoved: new Set(['C']), targetMoved: new Set(),
+    keys: ['A', 'C', 'D'],
+  });
+  assert.ok(r.ok, JSON.stringify(r));
+  assert.deepStrictEqual(r.merged.order, ['A', 'C', 'B', 'D']);
+  assert.strictEqual(r.merged.clauses.get('A').body, 'AAA-源');
+  assert.strictEqual(r.merged.clauses.get('B').body, 'BBB-目'); // 目标自身改动保留
+  assert.ok(r.merged.edges.some((e) => e.source === 'D' && e.target === 'A'), '新增条款的出站引用随条款移植');
+  assert.ok(r.merged.edges.some((e) => e.source === 'B' && e.target === 'A'), '目标既有引用保留');
+  assert.strictEqual(r.applied.length, 3);
+  assert.ok(r.mergedMoved.has('C'), '移动记录并入目标移动集合');
+});
+
+test('planTransplant：未选条款的来源改动不移植', () => {
+  const { base, source } = transplantFixture();
+  const target = S(
+    ['A', 'B', 'C'],
+    [['A', '总则', 'AAA'], ['B', '会员', 'BBB'], ['C', '附则', 'CCC']],
+    base.edges,
+  );
+  const r = planTransplant({
+    baseline: base, source, target,
+    sourceMoved: new Set(['C']), targetMoved: new Set(),
+    keys: ['A'],
+  });
+  assert.ok(r.ok, JSON.stringify(r));
+  assert.deepStrictEqual(r.merged.order, ['A', 'B', 'C'], '未选移动不移植');
+  assert.ok(!r.merged.clauses.has('D'), '未选新增不移植');
+  assert.strictEqual(r.merged.clauses.get('A').body, 'AAA-源');
+});
+
+test('planTransplant：来源对该标识无改动 -> no-source-change', () => {
+  const { base, source } = transplantFixture();
+  const target = S(['A', 'B', 'C'], [['A', '总则', 'AAA'], ['B', '会员', 'BBB'], ['C', '附则', 'CCC']], base.edges);
+  const r = planTransplant({ baseline: base, source, target, sourceMoved: new Set(['C']), keys: ['B'] });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'no-source-change');
+  assert.deepStrictEqual(r.keys, ['B']);
+});
+
+test('planTransplant：目标对同一条款已有不同改动 -> 逐条冲突', () => {
+  const { base, source } = transplantFixture();
+  const target = S(
+    ['A', 'B', 'C'],
+    [['A', '总则', 'AAA-另'], ['B', '会员', 'BBB'], ['C', '附则', 'CCC']],
+    base.edges,
+  );
+  const r = planTransplant({ baseline: base, source, target, sourceMoved: new Set(['C']), keys: ['A'] });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'conflict');
+  assert.strictEqual(r.conflicts[0].kind, 'modify-modify');
+  assert.strictEqual(r.conflicts[0].key, 'A');
+});
+
+test('planTransplant：删除/修改交叉冲突（delete-modify 与 modify-delete）', () => {
+  const base = S(['A', 'B'], [['A', '总则', 'AAA'], ['B', '会员', 'BBB']], []);
+  const srcDel = S(['B'], [['B', '会员', 'BBB']], []); // 来源删除 A
+  const tgtMod = S(['A', 'B'], [['A', '总则', 'AAA-目'], ['B', '会员', 'BBB']], []); // 目标改 A
+  const r1 = planTransplant({ baseline: base, source: srcDel, target: tgtMod, keys: ['A'] });
+  assert.strictEqual(r1.reason, 'conflict');
+  assert.strictEqual(r1.conflicts[0].kind, 'delete-modify');
+  const r2 = planTransplant({ baseline: base, source: tgtMod, target: srcDel, keys: ['A'] });
+  assert.strictEqual(r2.reason, 'conflict');
+  assert.strictEqual(r2.conflicts[0].kind, 'modify-delete');
+});
+
+test('planTransplant：同标识新增内容不同 -> add-add 冲突；内容相同 -> 收敛', () => {
+  const base = S(['A'], [['A', '总则', 'AAA']], []);
+  const source = S(['A', 'X'], [['A', '总则', 'AAA'], ['X', '新条', 'x-源']], []);
+  const tDiff = S(['A', 'X'], [['A', '总则', 'AAA'], ['X', '新条', 'x-目']], []);
+  const r1 = planTransplant({ baseline: base, source, target: tDiff, keys: ['X'] });
+  assert.strictEqual(r1.reason, 'conflict');
+  assert.strictEqual(r1.conflicts[0].kind, 'add-add');
+  const tSame = S(['A', 'X'], [['A', '总则', 'AAA'], ['X', '新条', 'x-源']], []);
+  const r2 = planTransplant({ baseline: base, source, target: tSame, keys: ['X'] });
+  assert.strictEqual(r2.ok, false);
+  assert.strictEqual(r2.reason, 'no-changes', '全部改动已相同（收敛）-> 无需移植');
+  assert.deepStrictEqual(r2.converged.map((c) => c.key), ['X']);
+});
+
+test('planTransplant：双方移动同一条款到不同落点 -> move-move 冲突；同落点收敛', () => {
+  const base = S(['A', 'B', 'C'], [['A', '总则'], ['B', '会员'], ['C', '附则']], []);
+  const source = S(['A', 'C', 'B'], [['A', '总则'], ['C', '附则'], ['B', '会员']], []); // C 移到 A 后
+  const tOther = S(['C', 'A', 'B'], [['C', '附则'], ['A', '总则'], ['B', '会员']], []); // C 移到最前
+  const r1 = planTransplant({
+    baseline: base, source, target: tOther,
+    sourceMoved: new Set(['C']), targetMoved: new Set(['C']), keys: ['C'],
+  });
+  assert.strictEqual(r1.reason, 'conflict');
+  assert.strictEqual(r1.conflicts[0].kind, 'move-move');
+  const tSame = S(['A', 'C', 'B'], [['A', '总则'], ['C', '附则'], ['B', '会员']], []);
+  const r2 = planTransplant({
+    baseline: base, source, target: tSame,
+    sourceMoved: new Set(['C']), targetMoved: new Set(['C']), keys: ['C'],
+  });
+  assert.strictEqual(r2.reason, 'no-changes');
+  assert.deepStrictEqual(r2.converged, [{ key: 'C', kinds: ['position'] }]);
+});
+
+test('planTransplant：出站引用改成不同集合 -> refs-conflict；相同集合收敛', () => {
+  const base = S(['A', 'B', 'C'], [['A', '总则'], ['B', '会员'], ['C', '附则']], []);
+  const source = S(['A', 'B', 'C'], [['A', '总则'], ['B', '会员'], ['C', '附则']], [{ source: 'A', target: 'C', label: '' }]);
+  const tDiff = S(['A', 'B', 'C'], [['A', '总则'], ['B', '会员'], ['C', '附则']], [{ source: 'A', target: 'B', label: '' }]);
+  const r1 = planTransplant({ baseline: base, source, target: tDiff, keys: ['A'] });
+  assert.strictEqual(r1.reason, 'conflict');
+  assert.strictEqual(r1.conflicts[0].kind, 'refs-conflict');
+  const tSame = S(['A', 'B', 'C'], [['A', '总则'], ['B', '会员'], ['C', '附则']], [{ source: 'A', target: 'C', label: '' }]);
+  const r2 = planTransplant({ baseline: base, source, target: tSame, keys: ['A'] });
+  assert.strictEqual(r2.reason, 'no-changes');
+});
+
+test('planTransplant：移植新造成悬空引用 -> 整次拒绝并列明（不自动移入引用目标）', () => {
+  const base = S(['A', 'B'], [['A', '总则'], ['B', '会员']], []);
+  // 来源新增 E（引用 Z）与 Z；只选 E -> E->Z 悬空
+  const source = S(
+    ['A', 'B', 'E', 'Z'],
+    [['A', '总则'], ['B', '会员'], ['E', 'E条'], ['Z', 'Z条']],
+    [{ source: 'E', target: 'Z', label: '见' }],
+  );
+  const target = S(['A', 'B'], [['A', '总则'], ['B', '会员']], []);
+  const r1 = planTransplant({ baseline: base, source, target, keys: ['E'] });
+  assert.strictEqual(r1.ok, false);
+  assert.strictEqual(r1.reason, 'dangling');
+  assert.ok(r1.dangling.some((d) => d.source === 'E' && d.target === 'Z'));
+  // 一并选择 Z -> 成功
+  const r2 = planTransplant({ baseline: base, source, target, keys: ['E', 'Z'] });
+  assert.ok(r2.ok, JSON.stringify(r2.dangling || r2.conflicts));
+  assert.deepStrictEqual(r2.merged.order, ['A', 'B', 'E', 'Z']);
+});
+
+test('planTransplant：目标既有悬空暂存不受影响，只拦截新造成的悬空', () => {
+  const base = S(['A', 'B'], [['A', '总则'], ['B', '会员']], []);
+  const source = S(['A', 'B'], [['A', '总则', 'AAA-源'], ['B', '会员']], []);
+  // 目标已暂存一条悬空引用 A->GHOST
+  const target = S(['A', 'B'], [['A', '总则'], ['B', '会员']], [{ source: 'A', target: 'GHOST', label: '' }]);
+  const r = planTransplant({ baseline: base, source, target, keys: ['A'] });
+  assert.ok(r.ok, '目标既有悬空不阻止移植');
+  assert.ok(r.merged.edges.some((e) => e.target === 'GHOST'), '既有悬空引用原样保留');
+});
+
+test('planTransplant：移植删除会按来源侧清理该条款出边，入边残留则悬空拒绝', () => {
+  const base = S(
+    ['A', 'B'],
+    [['A', '总则'], ['B', '会员']],
+    [{ source: 'B', target: 'A', label: '参见' }],
+  );
+  // 来源删除 B 并清理其出边 B->A
+  const source = S(['A'], [['A', '总则']], []);
+  const target = S(['A', 'B'], [['A', '总则'], ['B', '会员']], base.edges);
+  const r = planTransplant({ baseline: base, source, target, keys: ['B'] });
+  assert.ok(r.ok, JSON.stringify(r));
+  assert.deepStrictEqual(r.merged.order, ['A']);
+  assert.strictEqual(r.merged.edges.length, 0, '被删条款的出边随来源侧一并清理');
 });
 
 console.log(`\n${passed} 项测试全部通过`);

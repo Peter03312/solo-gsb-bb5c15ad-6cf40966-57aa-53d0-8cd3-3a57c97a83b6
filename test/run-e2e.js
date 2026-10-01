@@ -89,6 +89,21 @@ async function main() {
     } finally {
       server4.kill();
     }
+    // 草案间移植套件：再换空库
+    await new Promise((r) => setTimeout(r, 300));
+    fs.rmSync(tmpDb, { force: true });
+    for (const ext of ['-wal', '-shm']) fs.rmSync(tmpDb + ext, { force: true });
+    const server5 = spawn(process.execPath, [path.join(root, 'src/server.js')], {
+      cwd: root,
+      env: { ...process.env, DB_PATH: tmpDb, PORT: port },
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+    await waitForServer();
+    try {
+      await run('transplant.e2e.js');
+    } finally {
+      server5.kill();
+    }
     console.log('\n端到端测试全部通过');
   } catch (err) {
     console.error(err.message);

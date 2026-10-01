@@ -115,6 +115,21 @@ CREATE TABLE IF NOT EXISTS preview_tokens (
   consumed INTEGER NOT NULL DEFAULT 0          -- 确认发布成功后置 1
 );
 CREATE INDEX IF NOT EXISTS idx_preview_draft ON preview_tokens(draft_id);
+
+-- 草案间移植确认凭据：预演成功后落库，确认时校验两份草案修订号并重算比对；
+-- 预演本身不修改任何草案内容，确认成功才一次性应用到目标草案。
+CREATE TABLE IF NOT EXISTS transplant_tokens (
+  token TEXT PRIMARY KEY,
+  target_id INTEGER NOT NULL REFERENCES drafts(id),
+  source_id INTEGER NOT NULL REFERENCES drafts(id),
+  created_at TEXT NOT NULL,
+  source_revision INTEGER NOT NULL,      -- 预演时来源草案修订号
+  target_revision INTEGER NOT NULL,      -- 预演时目标草案修订号
+  keys_json TEXT NOT NULL,               -- 所选条款标识（JSON 数组）
+  final_content TEXT NOT NULL,           -- 移植后目标内容（含移动记录）规范化 JSON
+  consumed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_transplant_target ON transplant_tokens(target_id);
 `;
 
 function openDb(dbPath) {
@@ -495,6 +510,48 @@ function prunePreviewTokens(db, createdAtCutoff) {
   db.prepare('DELETE FROM preview_tokens WHERE consumed = 1 OR created_at < ?').run(createdAtCutoff);
 }
 
+// ---------------------------------------------------------------------------
+// 草案间移植确认凭据（调用方负责事务）
+// ---------------------------------------------------------------------------
+function insertTransplantToken(db, row) {
+  db.prepare(
+    `INSERT INTO transplant_tokens
+       (token, target_id, source_id, created_at, source_revision, target_revision, keys_json, final_content, consumed)
+     VALUES (?,?,?,?,?,?,?,?,0)`,
+  ).run(
+    row.token,
+    row.targetId,
+    row.sourceId,
+    nowIso(),
+    row.sourceRevision,
+    row.targetRevision,
+    JSON.stringify(row.keys),
+    row.finalContent,
+  );
+}
+
+function getTransplantToken(db, token) {
+  const row = db.prepare('SELECT * FROM transplant_tokens WHERE token = ?').get(token);
+  if (!row) return null;
+  row.consumed = !!row.consumed;
+  row.keys = JSON.parse(row.keys_json || '[]');
+  return row;
+}
+
+// 同一目标草案重新预演：旧凭据作废（确认时返回 TRANSPLANT_TOKEN_NOT_FOUND）。
+function supersedeTransplantTokens(db, targetId) {
+  db.prepare('DELETE FROM transplant_tokens WHERE target_id = ? AND consumed = 0').run(targetId);
+}
+
+function markTransplantConsumed(db, token) {
+  db.prepare('UPDATE transplant_tokens SET consumed = 1 WHERE token = ?').run(token);
+}
+
+// 清理陈旧凭据（已消费或早于截止时间），避免无限堆积。
+function pruneTransplantTokens(db, createdAtCutoff) {
+  db.prepare('DELETE FROM transplant_tokens WHERE consumed = 1 OR created_at < ?').run(createdAtCutoff);
+}
+
 module.exports = {
   openDb,
   nowIso,
@@ -516,6 +573,11 @@ module.exports = {
   supersedePreviewTokens,
   markPreviewConsumed,
   prunePreviewTokens,
+  insertTransplantToken,
+  getTransplantToken,
+  supersedeTransplantTokens,
+  markTransplantConsumed,
+  pruneTransplantTokens,
   draftSnapshotJson,
   parseDraftSnapshot,
   insertDraftOperation,

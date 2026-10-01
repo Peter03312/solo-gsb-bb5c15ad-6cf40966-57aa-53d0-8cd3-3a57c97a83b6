@@ -21,6 +21,11 @@ const {
   supersedePreviewTokens,
   markPreviewConsumed,
   prunePreviewTokens,
+  insertTransplantToken,
+  getTransplantToken,
+  supersedeTransplantTokens,
+  markTransplantConsumed,
+  pruneTransplantTokens,
   draftSnapshotJson,
   listDraftOperations,
   getDraftOperation,
@@ -33,6 +38,7 @@ const {
   validateState,
   hasBlockingIssues,
   replayDraft,
+  planTransplant,
   diffStates,
   textDiff,
   pickEffectiveVersion,
@@ -612,6 +618,290 @@ function handleDraftImpact(draftId) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 草案间移植：预演 / 确认
+// 在两份仍开放且基线相同的并行草案间，按条款标识把来源草案相对共同基线的
+// 改动移植到目标草案：
+//   - 预演（transplant-preview）只计算并发放确认凭据，不修改任何草案；
+//     目标对所选条款已有不同改动时逐条说明冲突；已相同的改动收敛；
+//     移植新造成悬空引用时整次拒绝并列明；未选条款与来源草案保持原样，
+//     不自动移入引用目标条款。
+//   - 确认（transplant-confirm）在同一事务内校验预演时两份草案的修订号
+//     （任一变化均拒绝旧确认），重算结果须与预演逐字节一致；成功后在目标
+//     操作历史中记为一次可撤销操作，并使目标旧的发布预览凭据失效。
+// ---------------------------------------------------------------------------
+// 按当前库内容计算移植计划（预览与确认共用，保证口径一致）。
+function computeTransplant({ tMeta, sMeta, keys }) {
+  const baseline = loadVersionState(db, tMeta.baseline_id);
+  const source = loadDraftState(db, sMeta.id);
+  const target = loadDraftState(db, tMeta.id);
+  const sourceMoved = new Set(sMeta.moved_keys);
+  const targetMoved = new Set(tMeta.moved_keys);
+  const plan = planTransplant({ baseline, source, target, sourceMoved, targetMoved, keys });
+  return { plan, source, target, targetMoved };
+}
+
+// 移植计划失败 -> 与预演/确认共用的错误响应（两份草案均不被改动）。
+function transplantPlanError(plan, tMeta, sMeta) {
+  const ctx = {
+    target_id: tMeta.id,
+    source_id: sMeta.id,
+    baseline_id: tMeta.baseline_id,
+    target_revision: tMeta.revision,
+    source_revision: sMeta.revision,
+  };
+  if (plan.reason === 'no-source-change') {
+    return {
+      status: 400,
+      payload: {
+        ...ctx,
+        error: 'VALIDATION',
+        message: `来源草案相对共同基线对以下标识没有改动：${plan.keys.join('、')}`,
+        keys: plan.keys,
+      },
+    };
+  }
+  if (plan.reason === 'no-changes') {
+    return {
+      status: 400,
+      payload: {
+        ...ctx,
+        error: 'NO_CHANGES',
+        message: '所选改动在目标草案中已全部相同（收敛），无需移植',
+        converged: plan.converged,
+      },
+    };
+  }
+  if (plan.reason === 'conflict') {
+    return {
+      status: 409,
+      payload: {
+        ...ctx,
+        error: 'TRANSPLANT_CONFLICT',
+        message: '目标草案对所选条款已有不同改动，移植被拒绝（两份草案均未改动）；可取消选择冲突条款或先调和后再预演',
+        conflicts: plan.conflicts,
+      },
+    };
+  }
+  return {
+    status: 409,
+    payload: {
+      ...ctx,
+      error: 'TRANSPLANT_DANGLING',
+      message: '移植将新造成悬空引用，整次拒绝（两份草案均未改动）；可将引用目标条款一并选择，或先在草案中处理这些引用',
+      dangling: plan.dangling,
+    },
+  };
+}
+
+function handleTransplantPreview(draftId, body) {
+  const targetMeta = getDraftMeta(db, draftId);
+  if (!targetMeta) return { status: 404, payload: { error: 'NOT_FOUND', message: '目标草案不存在' } };
+  if (targetMeta.status !== 'open') {
+    return { status: 409, payload: { error: 'CLOSED', message: '目标草案已发布，不能再接受移植' } };
+  }
+  const sourceId = typeof body.source_id === 'number' ? body.source_id : parseInt(body.source_id, 10);
+  if (!Number.isInteger(sourceId) || sourceId <= 0) {
+    return { status: 400, payload: { error: 'VALIDATION', message: '请指定来源草案 source_id（整数）' } };
+  }
+  if (sourceId === draftId) {
+    return { status: 400, payload: { error: 'VALIDATION', message: '来源与目标不能是同一草案' } };
+  }
+  const keys = Array.isArray(body.keys)
+    ? [...new Set(body.keys.map((k) => String(k ?? '').trim()).filter(Boolean))]
+    : [];
+  if (!keys.length) {
+    return { status: 400, payload: { error: 'VALIDATION', message: '请至少选择一个要移植的条款标识（keys）' } };
+  }
+  const sourceMeta = getDraftMeta(db, sourceId);
+  if (!sourceMeta) return { status: 404, payload: { error: 'NOT_FOUND', message: '来源草案不存在' } };
+  if (sourceMeta.status !== 'open') {
+    return { status: 409, payload: { error: 'SOURCE_CLOSED', message: '来源草案已发布，不能再作为移植来源' } };
+  }
+  if (sourceMeta.baseline_id !== targetMeta.baseline_id) {
+    return {
+      status: 409,
+      payload: {
+        error: 'BASELINE_MISMATCH',
+        message: `两份草案基线不同（来源基线 v${sourceMeta.baseline_id}、目标基线 v${targetMeta.baseline_id}），只能在基线相同的并行草案间移植`,
+      },
+    };
+  }
+
+  return runImmediate(() => {
+    const nowMs = Date.now();
+    // 顺手清理陈旧凭据：已消费或超过 7 天的记录。
+    pruneTransplantTokens(db, new Date(nowMs - 7 * 24 * 3600 * 1000).toISOString());
+    // 事务内重读元数据（与并发编辑/发布串行化）
+    const tMeta = getDraftMeta(db, draftId);
+    const sMeta = getDraftMeta(db, sourceId);
+    if (tMeta.status !== 'open') {
+      return { status: 409, payload: { error: 'CLOSED', message: '目标草案已发布，不能再接受移植' } };
+    }
+    if (!sMeta || sMeta.status !== 'open') {
+      return { status: 409, payload: { error: 'SOURCE_CLOSED', message: '来源草案已发布，不能再作为移植来源' } };
+    }
+
+    const { plan, target, targetMoved } = computeTransplant({ tMeta, sMeta, keys });
+    if (!plan.ok) return transplantPlanError(plan, tMeta, sMeta);
+
+    // 同一目标草案只保留最新一份未消费凭据（旧凭据确认时返回 TRANSPLANT_TOKEN_NOT_FOUND）。
+    const token = newPreviewToken();
+    supersedeTransplantTokens(db, draftId);
+    insertTransplantToken(db, {
+      token,
+      targetId: draftId,
+      sourceId,
+      sourceRevision: sMeta.revision,
+      targetRevision: tMeta.revision,
+      keys,
+      finalContent: draftSnapshotJson(tMeta.name, plan.merged, plan.mergedMoved),
+    });
+
+    // 预演响应：移植后目标的条款顺序、标题正文与出站引用差异（相对目标当前状态）
+    const movedDelta = new Set([...plan.mergedMoved].filter((k) => !targetMoved.has(k) && plan.merged.clauses.has(k)));
+    const diff = diffStates(target, plan.merged, movedDelta);
+    return {
+      status: 200,
+      payload: {
+        preview: true,
+        token,
+        target_id: tMeta.id,
+        target_name: tMeta.name,
+        source_id: sMeta.id,
+        source_name: sMeta.name,
+        baseline_id: tMeta.baseline_id,
+        target_revision: tMeta.revision,
+        source_revision: sMeta.revision,
+        keys,
+        applied: plan.applied,
+        converged: plan.converged,
+        created_at: nowIso(),
+        final: serializeState(plan.merged),
+        final_moved_keys: [...movedDelta],
+        diff: {
+          added: diff.added,
+          deleted: diff.deleted,
+          changed: diff.changed,
+          moved: diff.moved,
+          refs_added: diff.refsAdded,
+          refs_removed: diff.refsRemoved,
+        },
+        changed_detail: diff.changed.map((c) => {
+          const b = target.clauses.get(c.key);
+          const d = plan.merged.clauses.get(c.key);
+          return {
+            ...c,
+            titleSegments: b.title !== d.title ? textDiff(b.title, d.title) : null,
+            bodySegments: c.body ? textDiff(b.body, d.body) : null,
+          };
+        }),
+      },
+    };
+  });
+}
+
+function handleTransplantConfirm(draftId, body) {
+  const tokenRaw = body.token;
+  if (typeof tokenRaw !== 'string' || !/^[0-9a-f]{64}$/.test(tokenRaw)) {
+    return {
+      status: 400,
+      payload: { error: 'VALIDATION', message: '请携带预演成功时返回的 token（64 位十六进制确认凭据）' },
+    };
+  }
+  const rec = getTransplantToken(db, tokenRaw);
+  if (!rec || rec.target_id !== draftId) {
+    return {
+      status: 404,
+      payload: { error: 'TRANSPLANT_TOKEN_NOT_FOUND', message: '移植确认凭据不存在或不属于该草案，请重新预演后再确认；草案未被改动。' },
+    };
+  }
+
+  return runImmediate(() => {
+    if (rec.consumed) {
+      return {
+        status: 409,
+        payload: { error: 'TRANSPLANT_ALREADY_CONSUMED', message: '该移植确认凭据已成功用于一次移植，不能重复使用；如需再次移植请重新预演。' },
+      };
+    }
+    const tMeta = getDraftMeta(db, draftId);
+    if (!tMeta) return { status: 404, payload: { error: 'NOT_FOUND', message: '目标草案不存在' } };
+    if (tMeta.status !== 'open') {
+      return { status: 409, payload: { error: 'CLOSED', message: '目标草案已发布，移植确认被拒绝；凭据失效。' } };
+    }
+    const sMeta = getDraftMeta(db, rec.source_id);
+    if (!sMeta || sMeta.status !== 'open') {
+      return { status: 409, payload: { error: 'SOURCE_CLOSED', message: '来源草案已发布或不存在，移植确认被拒绝；两份草案均未改动。' } };
+    }
+    if (sMeta.baseline_id !== tMeta.baseline_id) {
+      return { status: 409, payload: { error: 'BASELINE_MISMATCH', message: '两份草案基线已不一致，移植确认被拒绝；两份草案均未改动。' } };
+    }
+    // 修订号校验：预演后任一份草案被编辑/改名/撤销/重做/移植（修订号变化）都拒绝旧确认
+    if (tMeta.revision !== rec.target_revision || sMeta.revision !== rec.source_revision) {
+      return {
+        status: 409,
+        payload: {
+          error: 'TRANSPLANT_STALE_REVISION',
+          message: `预演后草案已变化（目标修订号 #${rec.target_revision}→#${tMeta.revision}，来源修订号 #${rec.source_revision}→#${sMeta.revision}），本次确认被拒绝；请重新预演后再确认，两份草案均未改动。`,
+          target_revision: tMeta.revision,
+          source_revision: sMeta.revision,
+        },
+      };
+    }
+    // 兜底：按当前内容重算移植计划，必须与预演逐字节一致
+    const { plan } = computeTransplant({ tMeta, sMeta, keys: rec.keys });
+    if (!plan.ok) {
+      return {
+        status: 409,
+        payload: { error: 'TRANSPLANT_INVALIDATED', message: '预演时的移植条件已不再满足，请重新预演；两份草案均未改动。' },
+      };
+    }
+    if (draftSnapshotJson(tMeta.name, plan.merged, plan.mergedMoved) !== rec.final_content) {
+      return {
+        status: 409,
+        payload: { error: 'TRANSPLANT_CONTENT_MISMATCH', message: '当前移植结果与预演不一致，凭据已失效；请重新预演，两份草案均未改动。' },
+      };
+    }
+
+    // 应用：在目标操作历史中记为一次可撤销操作（整体快照，撤销即还原）
+    appendDraftOperation(db, {
+      draftId,
+      kind: 'transplant',
+      summary: `移植：自草案「${sMeta.name}」迁入 ${plan.applied.length} 项条款改动（${plan.applied.map((a) => a.key).join('、')}）${
+        plan.converged.length ? `；${plan.converged.length} 项已相同（收敛）` : ''
+      }`,
+      detail: {
+        source_id: sMeta.id,
+        source_name: sMeta.name,
+        keys: rec.keys,
+        applied: plan.applied,
+        converged: plan.converged,
+      },
+      name: tMeta.name,
+      state: plan.merged,
+      movedSet: plan.mergedMoved,
+    });
+    // 目标旧的发布预览凭据立即失效
+    supersedePreviewTokens(db, draftId);
+    markTransplantConsumed(db, rec.token);
+
+    return {
+      status: 200,
+      payload: {
+        ok: true,
+        transplanted: true,
+        target_id: draftId,
+        source_id: sMeta.id,
+        keys: rec.keys,
+        applied: plan.applied,
+        converged: plan.converged,
+        draft: draftDetail(draftId),
+        history: draftHistoryPayload(draftId),
+      },
+    };
+  });
+}
+
 function draftRoutes(method, url, body, query) {
   const draftMatch = url.match(/^\/api\/drafts\/(\d+)(\/.*)?$/);
   if (!draftMatch) return null;
@@ -661,6 +951,8 @@ function draftRoutes(method, url, body, query) {
     return body.preview_token !== undefined ? handleConfirmPublish(draftId, body) : handlePublish(draftId, body);
   }
   if (method === 'POST' && sub === '/preview') return handlePreview(draftId, body);
+  if (method === 'POST' && sub === '/transplant-preview') return handleTransplantPreview(draftId, body);
+  if (method === 'POST' && sub === '/transplant-confirm') return handleTransplantConfirm(draftId, body);
 
   if (sub === '/clauses' || sub.startsWith('/clauses/')) {
     return clauseRoutes(method, sub, body, draftId);
