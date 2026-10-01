@@ -455,6 +455,13 @@ function renderDraft() {
         onclick: () => openImpact(d.id),
         title: '把草案按现有规则重放为候选版本，沿两版反向引用追溯受影响条款（只读）',
       }, '🔗 引用影响链'),
+      d.status === 'open'
+        ? el('button', {
+            class: 'btn secondary small',
+            onclick: () => openPort(d.id),
+            title: '在基线相同的并行草案间，按条款标识把来源草案的改动预演移植到本草案',
+          }, '🔀 跨草案移植')
+        : null,
       el('button', {
         class: d.publishable && d.status === 'open' ? 'btn' : 'btn',
         disabled: !d.publishable || d.status !== 'open',
@@ -548,6 +555,7 @@ const OP_KIND_LABEL = {
   'clause-edit': '改写',
   'clause-delete': '删除条款',
   'clause-move': '移动',
+  'clause-port': '跨草案移植',
   'ref-add': '新增引用',
   'ref-delete': '删除引用',
   rename: '改名',
@@ -597,7 +605,7 @@ function renderHistoryPanel(d) {
 }
 
 function historyKindClass(kind) {
-  if (kind === 'create') return 'open';
+  if (kind === 'create' || kind === 'clause-port') return 'open';
   if (kind === 'clause-add' || kind === 'ref-add') return 'ok';
   if (kind === 'clause-delete' || kind === 'ref-delete') return 'err';
   if (kind === 'clause-move') return 'neutral';
@@ -999,6 +1007,318 @@ function renderImpactModal(p) {
       el('button', { class: 'btn ghost', onclick: closeModal }, '关闭'),
     ],
   });
+}
+
+// ---------------------------------------------------------------------------
+// 跨草案移植：选择来源草案（同基线、仍开放）与改动条款 -> 预演差异/冲突 -> 确认
+// 确认携带两份草案预演时的修订号；成功后目标历史多一条可撤销的移植操作。
+// ---------------------------------------------------------------------------
+const PORT_FACET_LABEL = { body: '标题/正文', edges: '出站引用', position: '位置', add: '新增', delete: '删除' };
+const PORT_STATUS_LABEL = {
+  apply: ['将移植', 'ok'],
+  converged: ['已收敛', 'open'],
+  conflict: ['冲突', 'err'],
+  invalid: ['不可选', 'neutral'],
+};
+
+async function openPort(draftId) {
+  modal({
+    title: '跨草案移植条款改动',
+    wide: true,
+    body: el('div', { class: 'muted small' }, '正在读取可移植的并行草案（与本草案基线相同且仍开放）…'),
+    footer: [el('button', { class: 'btn ghost', onclick: closeModal }, '关闭')],
+  });
+  try {
+    const [target, sources] = await Promise.all([
+      api('GET', `/api/drafts/${draftId}`),
+      api('GET', `/api/drafts/${draftId}/port-sources`),
+    ]);
+    renderPortForm(target, sources);
+  } catch (e) {
+    renderPortMessage(e.payload || { message: e.message }, 'error');
+  }
+}
+
+function renderPortMessage(p, level = 'error') {
+  modal({
+    title: '跨草案移植条款改动',
+    wide: true,
+    body: renderIssueList([{ level, message: p.message || '操作失败' }, ...(p.invalid || [])]),
+    footer: [el('button', { class: 'btn ghost', onclick: closeModal }, '关闭')],
+  });
+}
+
+function renderPortForm(target, sources) {
+  if (!sources.sources.length) {
+    modal({
+      title: '跨草案移植条款改动',
+      wide: true,
+      body: el('div', {},
+        el('div', { class: 'empty' },
+          `没有与本草案基线相同（v${target.baseline_id}）且仍开放的其他草案，暂无可移植来源。`),
+        el('p', { class: 'muted small' }, '可先在“草案”页从同一已发布版本创建另一个并行草案。')),
+      footer: [el('button', { class: 'btn ghost', onclick: closeModal }, '关闭')],
+    });
+    return;
+  }
+
+  const errBox = el('div', {});
+  const clausesBox = el('div', {});
+  const sourceSel = el('select', { style: 'width:340px' },
+    ...sources.sources.map((s) => el('option', { value: String(s.id) },
+      `${s.name}（草案 #${s.id} · 修订号 #${s.revision} · ${s.change_count} 项改动）`)),
+  );
+
+  function currentSource() {
+    return sources.sources.find((s) => String(s.id) === sourceSel.value) || null;
+  }
+
+  async function renderClauseChoices() {
+    clausesBox.innerHTML = '';
+    const src = currentSource();
+    if (!src) return;
+    clausesBox.appendChild(el('div', { class: 'muted small', style: 'margin:6px 0' },
+      `来源草案「${src.name}」相对共同基线 v${src.baseline_id} 的改动条款（勾选要移植的标识）：`));
+    if (!src.changed_keys.length) {
+      clausesBox.appendChild(el('div', { class: 'empty small' }, '该草案相对基线没有改动。'));
+      return;
+    }
+    const list = el('div', { class: 'port-check-list' });
+    for (const key of src.changed_keys) {
+      const cb = el('input', { type: 'checkbox', value: key, checked: true });
+      cb.dataset.key = key;
+      list.appendChild(el('label', { class: 'port-check' }, cb, el('span', { class: 'key-chip' }, key)));
+    }
+    clausesBox.appendChild(list);
+  }
+  sourceSel.addEventListener('change', renderClauseChoices);
+  renderClauseChoices();
+
+  async function doPreview() {
+    errBox.innerHTML = '';
+    const src = currentSource();
+    const keys = [...clausesBox.querySelectorAll('input[type=checkbox]:checked')].map((cb) => cb.dataset.key);
+    if (!src) return;
+    if (!keys.length) {
+      errBox.appendChild(renderIssueList([{ message: '请至少勾选一个条款标识' }]));
+      return;
+    }
+    try {
+      const p = await api('POST', `/api/drafts/${target.id}/port-preview`,
+        { source_draft_id: src.id, clause_keys: keys });
+      renderPortPreview(target, src, keys, p);
+    } catch (e) {
+      errBox.appendChild(renderIssueList(e.payload?.invalid?.length ? e.payload.invalid : [{ message: e.message }]));
+    }
+  }
+
+  modal({
+    title: `跨草案移植 →「${target.name}」（目标草案 #${target.id}）`,
+    wide: true,
+    body: el('div', {},
+      el('p', { class: 'muted small' },
+        `在两个仍开放、共同基线 v${target.baseline_id} 的并行草案之间，按条款标识把来源草案相对基线的改动预演移植到本草案。只有目标草案会被更新，来源草案与未选条款保持原样；不会自动移入引用目标条款，若因此产生悬空引用将整次拒绝。`),
+      el('label', { class: 'fld' }, el('span', {}, '来源草案'), sourceSel),
+      clausesBox,
+      errBox,
+    ),
+    footer: [
+      el('button', { class: 'btn ghost', onclick: closeModal }, '取消'),
+      el('button', { class: 'btn secondary', onclick: doPreview }, '预演移植差异'),
+    ],
+  });
+}
+
+function renderPortPreview(target, source, keys, p) {
+  const body = el('div', {});
+  body.appendChild(el('div', { class: 'muted small', style: 'margin-bottom:10px' },
+    `来源「${p.source_draft_name}」（修订号 #${p.source_revision}） → 目标「${p.target_draft_name}」（修订号 #${p.target_revision}） · 共同基线 v${p.baseline_id} · 预演时刻 ${fmtTime(p.preview_at)}`));
+
+  const chips = [
+    el('span', { class: 'badge ok' }, `可移植 ${p.applied_keys.length}`),
+    el('span', { class: 'badge open' }, `已收敛 ${p.converged_keys.length}`),
+    el('span', { class: 'badge err' }, `冲突 ${p.conflicts.length}`),
+    el('span', { class: `badge ${p.new_dangling.length ? 'err' : 'neutral'}` }, `新悬空引用 ${p.new_dangling.length}`),
+  ];
+  body.appendChild(el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px' }, ...chips));
+
+  if (p.conflicts.length || p.new_dangling.length) {
+    body.appendChild(el('div', { class: 'issue error' }, el('span', {}, '⛔'),
+      el('div', {},
+        el('div', {}, el('strong', {}, p.new_dangling.length
+          ? '本次预演存在移植后新产生的悬空引用，确认会被整次拒绝（两份草案均不变）'
+          : '所选条款在目标草案上存在不同改动，确认会被拒绝（两份草案均不变）')),
+        el('div', { class: 'small muted' }, '可取消部分冲突条款后重新预演，或先在目标/来源草案中调整。'))));
+  }
+
+  // 逐条结果
+  body.appendChild(el('h4', {}, '逐条预演结果'));
+  const detailMap = new Map((p.changed_detail || []).map((c) => [c.key, c]));
+  for (const it of p.items) {
+    const [stLabel, stClass] = PORT_STATUS_LABEL[it.status] || [it.status, 'neutral'];
+    const node = el('div', { class: `clause ${it.status === 'conflict' ? 'changed-glow' : ''}` });
+    node.appendChild(el('div', { class: 'clause-hd' },
+      el('span', { class: 'key-chip' }, it.key),
+      el('span', { class: 'title' }, it.title || ''),
+      el('span', { class: `badge ${stClass}` }, stLabel),
+      it.kind ? el('span', { class: 'muted small' }, it.kind) : null,
+    ));
+    const cb = el('div', { class: 'clause-bd' });
+    const facetLine = (label, facets) => facets.length
+      ? el('div', { class: 'small' }, label, ' ', facets.map((f) => el('span', {
+          class: `badge ${f === 'body' || f === 'edges' || f === 'position' || f === 'add' || f === 'delete'
+            ? (it.status === 'conflict' ? 'err' : 'neutral') : 'neutral'}`,
+          style: 'margin-left:4px',
+        }, PORT_FACET_LABEL[f] || f)))
+      : null;
+    cb.appendChild(facetLine('来源改动面：', it.source_facets || []));
+    cb.appendChild(facetLine('目标已有改动面：', it.target_facets || []));
+    if (it.applied_facets?.length) cb.appendChild(facetLine('将采用来源的面：', it.applied_facets));
+    if (it.conflict_facets?.length) cb.appendChild(facetLine('冲突面：', it.conflict_facets));
+    if (it.message) cb.appendChild(el('div', { class: 'small muted', style: 'margin-top:4px' }, it.message));
+    const det = detailMap.get(it.key);
+    if (det?.bodySegments) {
+      cb.appendChild(el('div', { class: 'small muted', style: 'margin-top:4px' }, '移植后标题/正文（逐字差异）：'));
+      if (det.titleSegments) cb.appendChild(el('div', { html: segmentsHtml(det.titleSegments) }));
+      cb.appendChild(el('div', { class: 'clause-body', html: segmentsHtml(det.bodySegments) }));
+    }
+    node.appendChild(cb);
+    body.appendChild(node);
+  }
+
+  if (p.conflicts.length) body.appendChild(renderPortConflicts(p.conflicts));
+  if (p.new_dangling.length) body.appendChild(renderPortDangling(p.new_dangling));
+
+  body.appendChild(renderPortProjected(p));
+
+  const canApply = p.applicable && p.applied_keys.length > 0;
+  modal({
+    title: '移植预演结果（尚未写入）',
+    wide: true,
+    body,
+    footer: [
+      el('button', { class: 'btn ghost', onclick: () => openPort(target.id) }, '返回重选'),
+      el('button', {
+        class: 'btn', disabled: !canApply,
+        title: canApply ? '' : '存在冲突/新悬空或没有需要移植的改动时不可确认',
+        onclick: () => doPortConfirm(target, source, keys, p, body),
+      }, p.applied_keys.length
+        ? `确认移植 ${p.applied_keys.length} 项改动到目标`
+        : '没有可移植的改动'),
+    ],
+  });
+}
+
+function renderPortConflicts(conflicts) {
+  const box = el('div', { style: 'margin-top:8px' });
+  for (const c of conflicts) {
+    box.appendChild(el('div', { class: 'issue error' }, el('span', {}, '⚔️'),
+      el('div', {},
+        el('div', {}, el('strong', {}, `条款冲突 · ${c.key}（${c.kind}）`), ' 冲突面：',
+          ...(c.facets || []).map((f) => el('span', { class: 'badge err', style: 'margin-left:4px' }, PORT_FACET_LABEL[f] || f))),
+        el('div', { class: 'small muted' }, c.message),
+      )));
+  }
+  return box;
+}
+
+function renderPortDangling(dangling) {
+  const box = el('div', { style: 'margin-top:8px' });
+  for (const dg of dangling) {
+    box.appendChild(el('div', { class: 'issue error' }, el('span', {}, '🔗'),
+      el('div', {},
+        el('div', {}, el('strong', {}, '移植后将新产生悬空引用（系统不会自动移入引用目标）')),
+        el('div', { class: 'small muted' }, dg.message),
+      )));
+  }
+  return box;
+}
+
+// 投影后的目标草案：顺序、标题正文、出站引用差异
+function renderPortProjected(p) {
+  const box = el('div', {});
+  box.appendChild(el('h4', {}, '移植后目标草案预览'));
+  const diff = p.diff || {};
+  const chips = [];
+  if (diff.added?.length) chips.push(el('span', { class: 'badge ok' }, `新增 ${diff.added.length}：${diff.added.join('、')}`));
+  if (diff.deleted?.length) chips.push(el('span', { class: 'badge err' }, `删除 ${diff.deleted.length}：${diff.deleted.join('、')}`));
+  if (diff.moved?.length) chips.push(el('span', { class: 'badge warn' }, `移动 ${diff.moved.length}：${diff.moved.join('、')}`));
+  const changedKeys = (diff.changed || []).map((c) => c.key);
+  if (changedKeys.length) chips.push(el('span', { class: 'badge warn' }, `修改 ${changedKeys.length}：${changedKeys.join('、')}`));
+  if ((diff.refs_added?.length || 0) + (diff.refs_removed?.length || 0)) {
+    chips.push(el('span', { class: 'badge neutral' }, `引用 +${diff.refs_added.length} / −${diff.refs_removed.length}`));
+  }
+  if (chips.length) box.appendChild(el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px' }, ...chips));
+
+  const addedSet = new Set(diff.added || []);
+  const changedSet = new Set(changedKeys);
+  p.projected.clauses.forEach((c, i) => {
+    const cls = addedSet.has(c.key) ? 'added-glow' : changedSet.has(c.key) ? 'changed-glow' : '';
+    const node = el('div', { class: `clause ${cls}` });
+    node.appendChild(el('div', { class: 'clause-hd' },
+      el('span', { class: 'ord' }, `#${i + 1}`),
+      el('span', { class: 'key-chip' }, c.key),
+      el('span', { class: 'title' }, c.title),
+      addedSet.has(c.key) ? el('span', { class: 'badge ok' }, '新增') : null,
+      changedSet.has(c.key) ? el('span', { class: 'badge warn' }, '修改') : null,
+    ));
+    const outgoing = p.projected.refs.filter((r) => r.source === c.key);
+    const clauseKeys = new Set(p.projected.clauses.map((x) => x.key));
+    node.appendChild(el('div', { class: 'clause-bd' },
+      el('div', { class: 'clause-body' }, c.body),
+      outgoing.length ? el('div', { class: 'refs-line' }, '引用：',
+        ...outgoing.map((r) => el('span', { class: `ref-tag ${clauseKeys.has(r.target) ? '' : 'dangling'}` },
+          '→ ', el('span', { class: 'key-chip' }, r.target), r.label ? `（${r.label}）` : '',
+          !clauseKeys.has(r.target) ? el('span', { class: 'badge err' }, '悬空') : null))) : null,
+    ));
+    box.appendChild(node);
+  });
+
+  if (diff.refs_added?.length || diff.refs_removed?.length) {
+    box.appendChild(el('div', { class: 'small muted', style: 'margin-top:6px' }, '出站引用差异：'));
+    for (const r of diff.refs_removed || []) {
+      box.appendChild(el('div', {}, el('del', {}, `${r.source} → ${r.target}${r.label ? `（${r.label}）` : ''}`)));
+    }
+    for (const r of diff.refs_added || []) {
+      box.appendChild(el('div', {}, el('ins', {}, `${r.source} → ${r.target}${r.label ? `（${r.label}）` : ''}`)));
+    }
+  }
+  return box;
+}
+
+async function doPortConfirm(target, source, keys, preview, modalBody) {
+  try {
+    const r = await api('POST', `/api/drafts/${target.id}/port-confirm`, {
+      source_draft_id: source.id,
+      clause_keys: keys,
+      source_revision: preview.source_revision,
+      target_revision: preview.target_revision,
+    });
+    closeModal();
+    toast(`已把 ${r.applied_keys.length} 项改动从「${r.source_draft_name}」移植到本草案（历史中可撤销）`, 'ok');
+    await afterDraftEdit();
+  } catch (e) {
+    const p = e.payload || {};
+    const note = el('div', { style: 'margin-bottom:10px' });
+    if (p.error === 'STALE_DRAFT_REVISION') {
+      note.appendChild(renderIssueList([{
+        message: `${p.message || '预演后草案已变化，旧确认被拒绝'}\n请重新预演后再确认。`,
+      }]));
+      // 用最新修订号重新预演一次，提示冲突或允许直接确认由用户操作
+      try {
+        const fresh = await api('POST', `/api/drafts/${target.id}/port-preview`,
+          { source_draft_id: source.id, clause_keys: keys });
+        renderPortPreview(target, source, keys, fresh);
+      } catch (e2) {
+        renderPortMessage(e2.payload || { message: e2.message });
+      }
+    } else if (p.error === 'PORT_CONFLICT' || p.error === 'PORT_DANGLING') {
+      note.appendChild(renderIssueList([{ message: p.message }]));
+      modalBody.insertBefore(note, modalBody.firstChild);
+    } else {
+      toast(e.message, 'err');
+    }
+  }
 }
 
 function openPublish(draftId) {

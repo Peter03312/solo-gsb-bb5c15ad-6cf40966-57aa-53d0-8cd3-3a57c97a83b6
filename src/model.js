@@ -688,6 +688,364 @@ function referenceImpact({ latest, candidate }) {
   return { sources, affected, stats };
 }
 
+// ---------------------------------------------------------------------------
+// 跨草案条款移植：在两个仍开放、基线相同的并行草案（source -> target）间，
+// 仅按条款标识移植来源草案相对共同基线的改动面，投影到目标草案。
+//
+// 每个被选标识的改动面（facet）：标题/正文 body、出站引用集 edges、位置 position，
+// 以及整体的新增 add / 删除 delete。逐面判定：
+//   - 目标该面未动         -> 采用来源（apply）；
+//   - 两侧改动逐字相同     -> 收敛（converged），目标内容不变；
+//   - 两侧改动不同         -> 冲突（conflict），该条不写入，逐条列明冲突面；
+// 未选条款及来源草案整体保持原样，引用跟随条款归属，绝不自动带入引用目标。
+// 投影后相对目标“新产生”的悬空引用会单独列出（目标原有悬空原样保留）。
+// ---------------------------------------------------------------------------
+
+// 条款在草案顺序中的“基线锚点”：向前找最近的、共同基线中存在的前驱条款。
+// null 表示位于所有基线条款之前。用于判定双方对同一条款的移动是否落在同一位置。
+function portAnchor(order, key, baseKeys) {
+  const i = order.indexOf(key);
+  for (let j = i - 1; j >= 0; j--) {
+    if (baseKeys.has(order[j])) return order[j];
+  }
+  return null;
+}
+
+function danglingEdgeKeys(state) {
+  const set = new Set();
+  for (const e of state.edges) {
+    if (!state.clauses.has(e.source) || !state.clauses.has(e.target)) set.add(edgeKey(e));
+  }
+  return set;
+}
+
+// 入参：
+//   baseline/source/target：state；sourceMoved/targetMoved：各自的显式移动集合；
+//   selectedKeys：去重后的选中标识数组（调用方负责非空与基本格式校验）。
+// 返回：
+//   { results, conflicts, new_dangling, applied_keys, converged_keys,
+//     projected（投影后的目标 state）, projectedMoved（投影后的显式移动集合） }
+function planPort({ baseline, source, target, selectedKeys, sourceMoved, targetMoved }) {
+  sourceMoved = sourceMoved instanceof Set ? sourceMoved : new Set();
+  targetMoved = targetMoved instanceof Set ? targetMoved : new Set();
+  const baseKeys = new Set(baseline.order);
+  const ss = touchedClauses(baseline, source, sourceMoved); // 来源改动面
+  const ts = touchedClauses(baseline, target, targetMoved); // 目标改动面
+
+  const results = [];
+  const conflicts = [];
+  // 投影状态以目标为底，逐面覆盖
+  const clauses = new Map();
+  for (const k of target.order) clauses.set(k, { ...target.clauses.get(k) });
+  const ownerSource = new Set(); // 出边集改由来源提供的条款
+  const moved = new Set([...targetMoved].filter((k) => target.clauses.has(k)));
+  const placeKeys = []; // 需按来源锚点重新放置的条款（新增/移动移植）
+  const appliedKeys = [];
+  const convergedKeys = [];
+
+  const pushConflict = (key, kind, facets, message) => {
+    conflicts.push({ key, kind, facets, message });
+    const r = results.find((x) => x.key === key);
+    if (r) {
+      r.status = 'conflict';
+      r.conflict_facets = facets;
+      r.message = message;
+    }
+  };
+
+  for (const key of selectedKeys) {
+    const sc = ss.get(key);
+    const tc = ts.get(key);
+    const inBase = baseKeys.has(key);
+    const sClause = source.clauses.get(key);
+    const tClause = target.clauses.get(key);
+
+    // 选了来源并未改动（或在来源/基线中根本不存在）的标识：调用方通常先拦为 400。
+    if (!sc) {
+      const reason = source.clauses.has(key) ? 'no-source-change' : 'unknown-key';
+      results.push({ key, status: 'invalid', reason, source_facets: [], target_facets: [], applied_facets: [], conflict_facets: [] });
+      continue;
+    }
+
+    const sourceFacets = sc.added ? ['add'] : sc.deleted ? ['delete'] : ['body', 'edges', 'position'].filter((f) => sc[f]);
+    const targetFacets = !tc
+      ? []
+      : tc.added
+        ? ['add']
+        : tc.deleted
+          ? ['delete']
+          : ['body', 'edges', 'position'].filter((f) => tc[f]);
+
+    // ---- 情况 1：来源相对基线新增了该条款 ----
+    if (sc.added) {
+      if (!tClause) {
+        // 目标未新增：整条引入
+        clauses.set(key, { ...sClause });
+        ownerSource.add(key);
+        placeKeys.push(key);
+        appliedKeys.push(key);
+        results.push({
+          key, status: 'apply', kind: 'add',
+          source_facets: sourceFacets, target_facets: [], applied_facets: ['add'], conflict_facets: [],
+          title: sClause.title,
+        });
+      } else {
+        // 双方同标识新增：标题正文与出边集完全相同才收敛（位置忽略，沿用目标位置）
+        const sameBody = clauseEqual(sClause, tClause);
+        const sameEdges = edgeSetsEqual(edgesOf(source, key), edgesOf(target, key));
+        const facets = [...(sameBody ? [] : ['body']), ...(sameEdges ? [] : ['edges'])];
+        if (sameBody && sameEdges) {
+          convergedKeys.push(key);
+          results.push({
+            key, status: 'converged', kind: 'add-add',
+            source_facets: sourceFacets, target_facets: ['add'], applied_facets: [], conflict_facets: [],
+            title: tClause.title,
+            message: '双方新增同标识条款且标题、正文与出站引用一致，已收敛（沿用目标位置）',
+          });
+        } else {
+          results.push({
+            key, status: 'conflict', kind: 'add-add',
+            source_facets: sourceFacets, target_facets: ['add'], applied_facets: [], conflict_facets: facets,
+            title: tClause.title,
+            message: `双方都新增了条款「${key}」但${facets.includes('body') ? '标题或正文' : ''}${facets.length === 2 ? '与' : ''}${facets.includes('edges') ? '出站引用' : ''}不一致`,
+          });
+          conflicts.push({
+            key, kind: 'add-add', facets,
+            message: `双方都新增了条款「${key}」但内容或出站引用不一致`,
+          });
+        }
+      }
+      continue;
+    }
+
+    // ---- 情况 2：来源相对基线删除了该条款 ----
+    if (sc.deleted) {
+      if (!tClause) {
+        // 双方都删除：收敛（目标既有的悬空出边暂存保持目标原样）
+        convergedKeys.push(key);
+        results.push({
+          key, status: 'converged', kind: 'delete-delete',
+          source_facets: ['delete'], target_facets: ['delete'], applied_facets: [], conflict_facets: [],
+          message: '双方都删除了该条款，已收敛为删除',
+        });
+        continue;
+      }
+      if (tc) {
+        // 目标对同一条款另有改动（正文/引用/移动）：冲突
+        const facets = targetFacets;
+        results.push({
+          key, status: 'conflict', kind: 'delete-modify',
+          source_facets: ['delete'], target_facets: facets, applied_facets: [], conflict_facets: facets,
+          title: tClause.title,
+          message: `来源删除了条款「${key}」，但目标同时改动了该条款（${facetLabels(facets)}）`,
+        });
+        conflicts.push({
+          key, kind: 'delete-modify', facets,
+          message: `来源删除了条款「${key}」，但目标同时改动了该条款`,
+        });
+        continue;
+      }
+      // 干净删除：条款移除，其出站引用按来源现状暂存（删除条款的引用在草案中保留为悬空）
+      clauses.delete(key);
+      ownerSource.add(key);
+      moved.delete(key);
+      appliedKeys.push(key);
+      results.push({
+        key, status: 'apply', kind: 'delete',
+        source_facets: ['delete'], target_facets: [], applied_facets: ['delete'], conflict_facets: [],
+      });
+      continue;
+    }
+
+    // ---- 情况 3：来源相对基线修改了已有的基线条款 ----
+    if (!tClause) {
+      // 目标已删除该条款而来源修改：冲突
+      const facets = sourceFacets;
+      results.push({
+        key, status: 'conflict', kind: 'modify-delete',
+        source_facets: facets, target_facets: ['delete'], applied_facets: [], conflict_facets: facets,
+        message: `来源修改了条款「${key}」，但目标已删除该条款`,
+      });
+      conflicts.push({
+        key, kind: 'modify-delete', facets,
+        message: `来源修改了条款「${key}」，但目标已删除该条款`,
+      });
+      continue;
+    }
+
+    const entry = {
+      key,
+      source_facets: sourceFacets,
+      target_facets: targetFacets,
+      applied_facets: [],
+      conflict_facets: [],
+      title: tClause.title,
+    };
+    const conflictMsgs = [];
+
+    // 面 1：标题/正文
+    if (sc.body) {
+      if (!tc || !tc.body) {
+        clauses.set(key, { ...sClause });
+        entry.applied_facets.push('body');
+      } else if (clauseEqual(sClause, tClause)) {
+        // 双方改成完全相同的标题正文：收敛
+      } else {
+        entry.conflict_facets.push('body');
+        conflictMsgs.push('标题或正文被双方改成不同内容');
+      }
+    }
+
+    // 面 2：出站引用集（出边跟随条款归属）
+    if (sc.edges) {
+      const sEdges = edgesOf(source, key);
+      if (!tc || !tc.edges) {
+        ownerSource.add(key);
+        entry.applied_facets.push('edges');
+      } else if (edgeSetsEqual(sEdges, edgesOf(target, key))) {
+        // 双方引用改动完全相同：收敛（保持目标集即可）
+      } else {
+        entry.conflict_facets.push('edges');
+        conflictMsgs.push('出站引用被双方做了不同增删');
+      }
+    }
+
+    // 面 3：位置（显式移动；比较基线锚点前驱）
+    if (sc.position) {
+      if (!tc || !tc.position) {
+        placeKeys.push(key);
+        moved.add(key);
+        entry.applied_facets.push('position');
+      } else {
+        const sa = portAnchor(source.order, key, baseKeys);
+        const ta = portAnchor(target.order, key, baseKeys);
+        if (sa === ta) {
+          // 双方移动到同一锚点：收敛（目标位置不变，移动记录保留）
+        } else {
+          entry.conflict_facets.push('position');
+          conflictMsgs.push(`双方把条款移动到不同位置（来源锚点${sa ? `「${sa}」之后` : '开头'}，目标锚点${ta ? `「${ta}」之后` : '开头'}）`);
+        }
+      }
+    }
+
+    if (entry.conflict_facets.length) {
+      entry.status = 'conflict';
+      entry.kind = 'modify-modify';
+      entry.message = `条款「${key}」存在双方不同改动：${conflictMsgs.join('；')}`;
+      // 冲突条目不写入：撤销本条目已登记的待应用面
+      if (entry.applied_facets.includes('body')) clauses.set(key, { ...tClause });
+      if (entry.applied_facets.includes('edges')) ownerSource.delete(key);
+      if (entry.applied_facets.includes('position')) {
+        const pi = placeKeys.indexOf(key);
+        if (pi >= 0) placeKeys.splice(pi, 1);
+        if (!targetMoved.has(key)) moved.delete(key);
+      }
+      entry.applied_facets = [];
+      conflicts.push({ key, kind: 'modify-modify', facets: entry.conflict_facets, message: entry.message });
+    } else if (entry.applied_facets.length) {
+      entry.status = 'apply';
+      entry.kind = 'modify';
+      if (clauses.has(key)) entry.title = clauses.get(key).title;
+      appliedKeys.push(key);
+    } else {
+      entry.status = 'converged';
+      entry.kind = 'modify-modify';
+      entry.message = '双方对该条款的改动已完全相同，自动收敛';
+      convergedKeys.push(key);
+    }
+    results.push(entry);
+  }
+
+  // ---- 顺序：未被移动/新增移植的条款保持目标顺序；移植条款按来源锚点插入 ----
+  const placeSet = new Set(placeKeys);
+  let order = target.order.filter((k) => clauses.has(k) && !placeSet.has(k));
+  const anchorSet = new Set(order);
+  const anchorTail = new Map();
+  for (const item of placeKeys) {
+    const idx = source.order.indexOf(item);
+    let anchor = null;
+    for (let i = idx - 1; i >= 0; i--) {
+      const k = source.order[i];
+      if (anchorSet.has(k) && order.includes(k)) {
+        anchor = k;
+        break;
+      }
+    }
+    if (anchor === null) {
+      let pos = order.findIndex((k) => anchorSet.has(k));
+      const tail = anchorTail.get(null);
+      if (tail != null && order.includes(tail)) pos = order.indexOf(tail) + 1;
+      if (pos === -1) pos = order.length;
+      order.splice(pos, 0, item);
+      anchorTail.set(null, item);
+    } else {
+      const tail = anchorTail.get(anchor);
+      let pos;
+      if (tail != null && order.includes(tail)) pos = order.indexOf(tail) + 1;
+      else pos = order.indexOf(anchor) + 1;
+      order.splice(pos, 0, item);
+      anchorTail.set(anchor, item);
+    }
+  }
+
+  // ---- 出边：保持目标原有边序；改由来源提供出边的条款按来源边序引入 ----
+  const edges = [];
+  const seenEdge = new Set();
+  for (const e of target.edges) {
+    if (!ownerSource.has(e.source)) {
+      edges.push({ ...e });
+      seenEdge.add(edgeKey(e));
+    }
+  }
+  for (const e of source.edges) {
+    if (ownerSource.has(e.source)) {
+      const k = edgeKey(e);
+      if (!seenEdge.has(k)) {
+        seenEdge.add(k);
+        edges.push({ ...e });
+      }
+    }
+  }
+
+  // 移动记录只保留存活条款
+  for (const k of [...moved]) if (!clauses.has(k)) moved.delete(k);
+
+  const projected = { order, clauses, edges };
+
+  // ---- 悬空引用：目标原有的暂存悬空不算新问题，仅列出投影后新产生的 ----
+  const oldDangling = danglingEdgeKeys(target);
+  const newDangling = [];
+  for (const e of edges) {
+    if ((!clauses.has(e.source) || !clauses.has(e.target)) && !oldDangling.has(edgeKey(e))) {
+      const miss = [];
+      if (!clauses.has(e.source)) miss.push('source');
+      if (!clauses.has(e.target)) miss.push('target');
+      newDangling.push({
+        source: e.source,
+        target: e.target,
+        label: e.label || '',
+        missing: miss,
+        message: `移植后引用 ${e.source} → ${e.target}${e.label ? `（${e.label}）` : ''} 的${miss.includes('target') ? '目标' : '来源'}条款在目标草案中不存在`,
+      });
+    }
+  }
+
+  return {
+    results,
+    conflicts,
+    new_dangling: newDangling,
+    applied_keys: appliedKeys,
+    converged_keys: convergedKeys,
+    projected,
+    projectedMoved: moved,
+  };
+}
+
+function facetLabels(facets) {
+  const map = { body: '标题/正文', edges: '出站引用', position: '位置', add: '新增', delete: '删除' };
+  return facets.map((f) => map[f] || f).join('、');
+}
+
 function buildState({ order, clauses, edges }) {
   return {
     order: [...order],
@@ -701,6 +1059,8 @@ module.exports = {
   movedKeys,
   touchedClauses,
   replayDraft,
+  planPort,
+  portAnchor,
   validateState,
   hasBlockingIssues,
   diffStates,

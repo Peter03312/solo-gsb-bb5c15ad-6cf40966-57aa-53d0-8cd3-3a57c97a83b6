@@ -5,6 +5,7 @@ const {
   buildState,
   touchedClauses,
   replayDraft,
+  planPort,
   validateState,
   hasBlockingIssues,
   diffStates,
@@ -500,6 +501,197 @@ test('referenceImpact：删除被引用条款且入边一并清理时，旧入�
   assert.ok(c, '变化前引用 B 的 C 仍作为受影响条款展示');
   assert.strictEqual(c.after, null);
   assert.strictEqual(c.status, 'broken-after');
+});
+
+// ---------------------------------------------------------------------------
+// 跨草案条款移植（planPort）
+// ---------------------------------------------------------------------------
+function portFixture() {
+  const B = S(
+    ['A', 'B', 'C'],
+    [['A', '总则'], ['B', '会员'], ['C', '附则']],
+    [{ source: 'A', target: 'B', label: '见' }],
+  );
+  // 来源：改 A 正文 + A 新增 A→C 引用；末尾新增 D（D→C）
+  const src = S(
+    ['A', 'B', 'C', 'D'],
+    [['A', '总则', 'A改'], ['B', '会员'], ['C', '附则'], ['D', '经费']],
+    [
+      { source: 'A', target: 'B', label: '见' },
+      { source: 'A', target: 'C', label: '' },
+      { source: 'D', target: 'C', label: '' },
+    ],
+  );
+  const tgt = S(
+    ['A', 'B', 'C'],
+    [['A', '总则'], ['B', '会员'], ['C', '附则']],
+    [{ source: 'A', target: 'B', label: '见' }],
+  );
+  return { B, src, tgt };
+}
+
+test('移植：目标未动的条款整面采用来源（正文/出站引用/新增），未选条款不变', () => {
+  const { B, src, tgt } = portFixture();
+  const p = planPort({ baseline: B, source: src, target: tgt, selectedKeys: ['A', 'D'] });
+  assert.strictEqual(p.conflicts.length, 0);
+  assert.strictEqual(p.new_dangling.length, 0);
+  assert.deepStrictEqual(p.applied_keys, ['A', 'D']);
+  assert.strictEqual(p.projected.clauses.get('A').body, 'A改');
+  assert.deepStrictEqual(p.projected.order, ['A', 'B', 'C', 'D']);
+  assert.deepStrictEqual(
+    p.projected.edges.filter((e) => e.source === 'A').map((e) => e.target).sort(),
+    ['B', 'C'],
+  );
+  assert.deepStrictEqual(p.projected.edges.filter((e) => e.source === 'D').map((e) => e.target), ['C']);
+  // B、C 内容不变
+  assert.strictEqual(p.projected.clauses.get('B').title, '会员');
+});
+
+test('移植：目标对同一面做了不同改动 -> 冲突列明面，该条不写入', () => {
+  const { B, src } = portFixture();
+  const tgt = S(
+    ['A', 'B', 'C'],
+    [['A', '总则', 'A的另一种改法'], ['B', '会员'], ['C', '附则']],
+    [{ source: 'A', target: 'B', label: '见' }],
+  );
+  const p = planPort({ baseline: B, source: src, target: tgt, selectedKeys: ['A'] });
+  assert.strictEqual(p.conflicts.length, 1);
+  assert.strictEqual(p.conflicts[0].kind, 'modify-modify');
+  assert.deepStrictEqual(p.conflicts[0].facets, ['body']);
+  // 冲突条目不写入：A 仍为目标正文，但来源的引用面目标未动——整条回滚，A→C 也不引入
+  assert.strictEqual(p.projected.clauses.get('A').body, 'A的另一种改法');
+  assert.deepStrictEqual(p.projected.edges.filter((e) => e.source === 'A').map((e) => e.target), ['B']);
+});
+
+test('移植：面级独立——目标只改引用、来源改正文，可移植正文不冲突', () => {
+  const { B, src } = portFixture();
+  const tgt = S(
+    ['A', 'B', 'C'],
+    [['A', '总则'], ['B', '会员'], ['C', '附则']],
+    [
+      { source: 'A', target: 'B', label: '见' },
+      { source: 'A', target: 'C', label: '目标加的' },
+    ],
+  );
+  const p = planPort({ baseline: B, source: src, target: tgt, selectedKeys: ['A'] });
+  const a = p.results.find((r) => r.key === 'A');
+  assert.strictEqual(a.status, 'conflict');
+  assert.deepStrictEqual(a.applied_facets, []);
+  assert.deepStrictEqual(a.conflict_facets, ['edges']);
+  assert.strictEqual(p.projected.edges.filter((e) => e.source === 'A' && e.label === '目标加的').length, 1);
+});
+
+test('移植：双方相同改动收敛，目标不变', () => {
+  const { B, src, tgt } = portFixture();
+  // 目标把 A 改成与来源完全相同（含 A→C）
+  const same = S(
+    ['A', 'B', 'C'],
+    [['A', '总则', 'A改'], ['B', '会员'], ['C', '附则']],
+    [
+      { source: 'A', target: 'B', label: '见' },
+      { source: 'A', target: 'C', label: '' },
+    ],
+  );
+  const p = planPort({ baseline: B, source: src, target: same, selectedKeys: ['A'] });
+  assert.deepStrictEqual(p.applied_keys, []);
+  assert.deepStrictEqual(p.converged_keys, ['A']);
+  assert.strictEqual(p.conflicts.length, 0);
+  assert.deepStrictEqual(p.projected.order, tgt.order);
+});
+
+test('移植：双方新增同标识但内容不同 -> add-add 冲突；相同则收敛', () => {
+  const { B, src, tgt } = portFixture();
+  const other = S(
+    ['A', 'B', 'C', 'D'],
+    [['A', '总则'], ['B', '会员'], ['C', '附则'], ['D', '经费-不同']],
+    [{ source: 'A', target: 'B', label: '见' }],
+  );
+  let p = planPort({ baseline: B, source: src, target: other, selectedKeys: ['D'] });
+  assert.strictEqual(p.conflicts[0].kind, 'add-add');
+  assert.deepStrictEqual(p.conflicts[0].facets, ['body', 'edges']);
+  assert.strictEqual(p.projected.clauses.get('D').title, '经费-不同'); // 保持目标
+
+  const same = S(
+    ['A', 'B', 'C', 'D'],
+    [['A', '总则'], ['B', '会员'], ['C', '附则'], ['D', '经费']],
+    [
+      { source: 'A', target: 'B', label: '见' },
+      { source: 'D', target: 'C', label: '' },
+    ],
+  );
+  p = planPort({ baseline: B, source: src, target: same, selectedKeys: ['D'] });
+  assert.deepStrictEqual(p.converged_keys, ['D']);
+});
+
+test('移植：来源删除、目标也删除 -> 收敛；目标改了同条款 -> delete-modify 冲突', () => {
+  const B = S(['A', 'B'], [['A', '总则'], ['B', '会员']], []);
+  const src = S(['A'], [['A', '总则']], []);
+  const bothDel = S(['A'], [['A', '总则']], []);
+  let p = planPort({ baseline: B, source: src, target: bothDel, selectedKeys: ['B'] });
+  assert.deepStrictEqual(p.converged_keys, ['B']);
+
+  const tgtEdited = S(['A', 'B'], [['A', '总则'], ['B', '会员改']], []);
+  p = planPort({ baseline: B, source: src, target: tgtEdited, selectedKeys: ['B'] });
+  assert.strictEqual(p.conflicts[0].kind, 'delete-modify');
+  assert.ok(p.projected.clauses.has('B'));
+});
+
+test('移植：来源删除而目标未动 -> 删除生效，其出边按来源暂存为悬空（整次拒绝并列明）', () => {
+  const B = S(
+    ['A', 'B', 'C'],
+    [['A', '总则'], ['B', '会员'], ['C', '附则']],
+    [{ source: 'A', target: 'B', label: '见' }],
+  );
+  // 来源删除 B，且保留 A→B 悬空暂存
+  const src = S(['A', 'C'], [['A', '总则'], ['C', '附则']], [{ source: 'A', target: 'B', label: '见' }]);
+  const tgt = S(
+    ['A', 'B', 'C'],
+    [['A', '总则'], ['B', '会员'], ['C', '附则']],
+    [{ source: 'A', target: 'B', label: '见' }],
+  );
+  const p = planPort({ baseline: B, source: src, target: tgt, selectedKeys: ['B'] });
+  assert.deepStrictEqual(p.applied_keys, ['B']);
+  assert.strictEqual(p.projected.clauses.has('B'), false);
+  assert.strictEqual(p.new_dangling.length, 1);
+  assert.strictEqual(p.new_dangling[0].source, 'A');
+  assert.strictEqual(p.new_dangling[0].target, 'B');
+});
+
+test('移植：不自动带入引用目标——只移植新增 D（D 引用目标 E），目标无 E -> 新悬空', () => {
+  const B = S(['A'], [['A', '总则']], []);
+  const src = S(['A', 'D', 'E'], [['A', '总则'], ['D', 'D条'], ['E', 'E条']], [{ source: 'D', target: 'E', label: '' }]);
+  const tgt = S(['A'], [['A', '总则']], []);
+  const p = planPort({ baseline: B, source: src, target: tgt, selectedKeys: ['D'] }); // 故意不选 E
+  assert.strictEqual(p.projected.clauses.has('E'), false);
+  assert.strictEqual(p.new_dangling.length, 1);
+  assert.deepStrictEqual([p.new_dangling[0].source, p.new_dangling[0].target], ['D', 'E']);
+});
+
+test('移植：目标原有的悬空引用不算新悬空', () => {
+  const B = S(['A'], [['A', '总则']], []);
+  const src = S(['A', 'B'], [['A', '总则', 'A改'], ['B', 'B条']], []);
+  const tgt = S(['A'], [['A', '总则']], [{ source: 'A', target: 'ZZZ', label: '' }]);
+  const p = planPort({ baseline: B, source: src, target: tgt, selectedKeys: ['A'] });
+  assert.strictEqual(p.new_dangling.length, 0);
+  assert.ok(p.projected.edges.some((e) => e.target === 'ZZZ')); // 原有悬空保留
+});
+
+test('移植：移动条款按来源锚点插入；双方移动到不同锚点 -> position 冲突', () => {
+  const B = S(['A', 'B', 'C'], [['A', '总则'], ['B', '会员'], ['C', '附则']], []);
+  const src = S(['A', 'C', 'B'], [['A', '总则'], ['B', '会员'], ['C', '附则']], []);
+  const tgt = S(['A', 'B', 'C'], [['A', '总则'], ['B', '会员'], ['C', '附则']], []);
+  let p = planPort({ baseline: B, source: src, target: tgt, selectedKeys: ['B'], sourceMoved: new Set(['B']) });
+  assert.deepStrictEqual(p.projected.order, ['A', 'C', 'B']);
+  assert.ok(p.projectedMoved.has('B'));
+
+  // 目标把 B 移到开头（锚点 null），来源锚点 A -> position 冲突
+  const tgtMoved = S(['B', 'A', 'C'], [['A', '总则'], ['B', '会员'], ['C', '附则']], []);
+  p = planPort({
+    baseline: B, source: src, target: tgtMoved, selectedKeys: ['B'],
+    sourceMoved: new Set(['B']), targetMoved: new Set(['B']),
+  });
+  assert.strictEqual(p.conflicts[0].facets.includes('position'), true);
+  assert.deepStrictEqual(p.projected.order, ['B', 'A', 'C']); // 保持目标位置
 });
 
 console.log(`\n${passed} 项测试全部通过`);

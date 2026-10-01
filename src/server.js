@@ -35,6 +35,8 @@ const {
   replayDraft,
   diffStates,
   textDiff,
+  planPort,
+  touchedClauses,
   pickEffectiveVersion,
   pendingVersions,
   scheduleNeighbors,
@@ -612,6 +614,369 @@ function handleDraftImpact(draftId) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 跨草案条款移植（两个仍开放、基线相同的并行草案之间）
+//   GET  /api/drafts/:id/port-sources           可向本草案移植改动的来源草案（同基线、仍开放）
+//   POST /api/drafts/:id/port-preview           预演 {source_draft_id, clause_keys}
+//   POST /api/drafts/:id/port-confirm           确认移植（携带两份草案预演时的修订号）
+// 仅更新目标草案；来源草案、未选条款保持原样，不自动移入引用目标。
+// 移植成功在目标操作历史中记为一次可撤销操作，并使目标旧发布预览凭据失效。
+// ---------------------------------------------------------------------------
+
+// 移植在目标草案差异中真正发生位置变化的条款：只取显式移动记录里位置确实改变的，
+// 因新增/删除条款而被动让位（索引变化但未被移植移动）的条款不计入。
+function positionChangedKeys(before, after, movedSet) {
+  const beforePos = new Map(before.order.map((k, i) => [k, i]));
+  const out = new Set();
+  for (let i = 0; i < after.order.length; i++) {
+    const k = after.order[i];
+    if (!before.clauses.has(k)) continue; // 新增条款在 added 中展示
+    if (movedSet.has(k) && beforePos.get(k) !== i) out.add(k);
+  }
+  return out;
+}
+
+function portChangedDetail(before, after, changedKeys) {
+  return changedKeys.map((key) => {
+    const b = before.clauses.get(key);
+    const d = after.clauses.get(key);
+    if (!b || !d) return { key, titleSegments: null, bodySegments: null };
+    return {
+      key,
+      titleSegments: b.title !== d.title ? textDiff(b.title, d.title) : null,
+      bodySegments: b.body !== d.body ? textDiff(b.body, d.body) : null,
+    };
+  });
+}
+
+function buildPortPayload({ targetId, sourceMeta, targetMeta, plan, beforeState, projected, projectedMoved }) {
+  const targetState = beforeState;
+  // 差异中的移动集合：投影后的显式移动记录 ∩ 位置相对移植前确实改变的条款。
+  // 被动让位（仅索引变化）与“移动过但移植后回到原位”的记录都不在此列。
+  const posChanged = positionChangedKeys(targetState, projected, projectedMoved);
+  const diff = diffStates(targetState, projected, posChanged);
+
+  const projectedMovedLive = [...projectedMoved].filter((k) => projected.clauses.has(k));
+
+  return {
+    target_draft_id: targetId,
+    target_draft_name: targetMeta.name,
+    target_revision: targetMeta.revision,
+    source_draft_id: sourceMeta.id,
+    source_draft_name: sourceMeta.name,
+    source_revision: sourceMeta.revision,
+    baseline_id: targetMeta.baseline_id,
+    preview_at: nowIso(),
+    items: plan.results,
+    applied_keys: plan.applied_keys,
+    converged_keys: plan.converged_keys,
+    conflicts: plan.conflicts,
+    new_dangling: plan.new_dangling,
+    applicable: plan.conflicts.length === 0 && plan.new_dangling.length === 0,
+    projected: serializeState(projected),
+    projected_moved_keys: projectedMovedLive,
+    diff: {
+      added: diff.added,
+      deleted: diff.deleted,
+      changed: diff.changed,
+      moved: diff.moved,
+      refs_added: diff.refsAdded,
+      refs_removed: diff.refsRemoved,
+    },
+    changed_detail: portChangedDetail(targetState, projected, diff.changed.map((c) => c.key)),
+  };
+}
+
+// 共用前置校验：目标草案、来源草案、开放状态、共同基线、选中标识。
+// 返回 { error:{status,payload} } 或 { sourceMeta,targetMeta,sourceState,targetState,sourceMoved,targetMoved,selected }。
+function loadPortContext(targetId, body) {
+  const targetMeta = getDraftMeta(db, targetId);
+  if (!targetMeta) return { error: { status: 404, payload: { error: 'NOT_FOUND', message: '目标草案不存在' } } };
+  if (targetMeta.status !== 'open') {
+    return { error: { status: 409, payload: { error: 'CLOSED', message: '目标草案已发布，不能再接受移植' } } };
+  }
+  const sourceId = parseInt(body.source_draft_id, 10);
+  if (!Number.isInteger(sourceId) || sourceId <= 0) {
+    return { error: { status: 400, payload: { error: 'VALIDATION', message: '请携带 source_draft_id（来源草案 id）' } } };
+  }
+  if (sourceId === targetId) {
+    return { error: { status: 400, payload: { error: 'VALIDATION', message: '来源草案与目标草案不能是同一个草案' } } };
+  }
+  const sourceMeta = getDraftMeta(db, sourceId);
+  if (!sourceMeta) return { error: { status: 404, payload: { error: 'NOT_FOUND', message: '来源草案不存在' } } };
+  if (sourceMeta.status !== 'open') {
+    return { error: { status: 409, payload: { error: 'CLOSED', message: '来源草案已发布，不能再作为移植来源' } } };
+  }
+  if (sourceMeta.baseline_id !== targetMeta.baseline_id) {
+    return {
+      error: {
+        status: 409,
+        payload: {
+          error: 'BASELINE_MISMATCH',
+          message: `两份草案基线不同：来源基于 v${sourceMeta.baseline_id}，目标基于 v${targetMeta.baseline_id}；只允许在基线相同的两个并行草案间移植`,
+        },
+      },
+    };
+  }
+
+  const rawKeys = Array.isArray(body.clause_keys) ? body.clause_keys : null;
+  if (!rawKeys || !rawKeys.length) {
+    return { error: { status: 400, payload: { error: 'VALIDATION', message: '请在 clause_keys 中至少选择一个条款标识' } } };
+  }
+  const selected = [];
+  const seenSel = new Set();
+  for (const k of rawKeys) {
+    if (typeof k !== 'string' || !k.trim()) {
+      return { error: { status: 400, payload: { error: 'VALIDATION', message: 'clause_keys 必须是非空字符串数组' } } };
+    }
+    const key = k.trim();
+    if (!seenSel.has(key)) {
+      seenSel.add(key);
+      selected.push(key);
+    }
+  }
+
+  const baseline = loadVersionState(db, targetMeta.baseline_id);
+  const sourceState = loadDraftState(db, sourceId);
+  const targetState = loadDraftState(db, targetId);
+  const sourceMoved = new Set(loadDraftMoved(db, sourceId));
+  const targetMoved = new Set(loadDraftMoved(db, targetId));
+
+  // 标识合法性：必须在基线或来源草案中存在，且来源相对共同基线确有改动
+  const invalid = [];
+  for (const key of selected) {
+    const kerr = keyError(key);
+    if (kerr) {
+      invalid.push({ key, reason: 'bad-key', message: `标识无效：${kerr}` });
+      continue;
+    }
+    if (!baseline.clauses.has(key) && !sourceState.clauses.has(key)) {
+      invalid.push({ key, reason: 'unknown-key', message: `条款「${key}」在共同基线与来源草案中均不存在` });
+      continue;
+    }
+    // 来源相对基线无改动（含被来源删除但基线也没有的不可能情形）
+    let changed = false;
+    if (!baseline.clauses.has(key)) changed = sourceState.clauses.has(key);
+    else if (!sourceState.clauses.has(key)) changed = true;
+    else {
+      const b = baseline.clauses.get(key);
+      const s = sourceState.clauses.get(key);
+      changed =
+        b.title !== s.title ||
+        b.body !== s.body ||
+        sourceMoved.has(key) ||
+        !edgeSetsEqualState(baseline.edges.filter((e) => e.source === key), sourceState.edges.filter((e) => e.source === key));
+    }
+    if (!changed) invalid.push({ key, reason: 'no-source-change', message: `来源草案相对共同基线未改动条款「${key}」，没有可移植的改动` });
+  }
+  if (invalid.length) {
+    return { error: { status: 400, payload: { error: 'VALIDATION', message: '选中的条款标识中包含不可移植项', invalid } } };
+  }
+
+  return { baseline, sourceMeta, targetMeta, sourceState, targetState, sourceMoved, targetMoved, selected };
+}
+
+function edgeSetsEqualState(a, b) {
+  const ka = new Set(a.map((e) => `${e.source}->${e.target}#${e.label || ''}`));
+  const kb = new Set(b.map((e) => `${e.source}->${e.target}#${e.label || ''}`));
+  if (ka.size !== kb.size) return false;
+  for (const k of ka) if (!kb.has(k)) return false;
+  return true;
+}
+
+function handlePortSources(draftId) {
+  const targetMeta = getDraftMeta(db, draftId);
+  if (!targetMeta) return { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
+  const out = [];
+  for (const d of listDrafts(db)) {
+    if (d.id === draftId || d.status !== 'open' || d.baseline_id !== targetMeta.baseline_id) continue;
+    const meta = getDraftMeta(db, d.id);
+    const baseline = loadVersionState(db, meta.baseline_id);
+    const st = loadDraftState(db, d.id);
+    const mv = new Set(loadDraftMoved(db, d.id));
+    const touched = touchedClauses(baseline, st, mv);
+    out.push({
+      id: d.id,
+      name: d.name,
+      baseline_id: d.baseline_id,
+      revision: meta.revision,
+      changed_keys: [...touched.keys()],
+      change_count: touched.size,
+      updated_at: d.updated_at,
+    });
+  }
+  return {
+    status: 200,
+    payload: {
+      draft_id: draftId,
+      draft_name: targetMeta.name,
+      baseline_id: targetMeta.baseline_id,
+      revision: targetMeta.revision,
+      sources: out,
+    },
+  };
+}
+
+function handlePortPreview(draftId, body) {
+  const ctx = loadPortContext(draftId, body);
+  if (ctx.error) return ctx.error;
+  const { baseline, sourceMeta, targetMeta, sourceState, targetState, sourceMoved, targetMoved, selected } = ctx;
+  const plan = planPort({
+    baseline,
+    source: sourceState,
+    target: targetState,
+    selectedKeys: selected,
+    sourceMoved,
+    targetMoved,
+  });
+  const payload = buildPortPayload({
+    targetId: draftId,
+    sourceMeta,
+    targetMeta,
+    plan,
+    beforeState: targetState,
+    projected: plan.projected,
+    projectedMoved: plan.projectedMoved,
+  });
+  return { status: 200, payload };
+}
+
+function handlePortConfirm(draftId, body) {
+  const revSource = body.source_revision;
+  const revTarget = body.target_revision;
+  if (!Number.isInteger(revSource) || !Number.isInteger(revTarget)) {
+    return {
+      status: 400,
+      payload: { error: 'VALIDATION', message: '确认移植必须携带预演时获得的 source_revision 与 target_revision（两份草案的整数修订号）' },
+    };
+  }
+
+  return runImmediate(() => {
+    // 先在不校验所选标识的前提下取得两份草案元数据：修订号过期优先于一切内容判定，
+    // 保证“预演后草案变化”一律按旧确认拒绝，而不是被 400 等错误掩盖。
+    const targetMetaNow = getDraftMeta(db, draftId);
+    if (!targetMetaNow) return { status: 404, payload: { error: 'NOT_FOUND', message: '目标草案不存在' } };
+    const sourceIdNow = parseInt(body.source_draft_id, 10);
+    const sourceMetaNow = Number.isInteger(sourceIdNow) ? getDraftMeta(db, sourceIdNow) : null;
+    const stale0 = [];
+    if (sourceMetaNow && sourceMetaNow.revision !== revSource) {
+      stale0.push({ side: 'source', expected: revSource, current: sourceMetaNow.revision });
+    }
+    if (targetMetaNow.revision !== revTarget) {
+      stale0.push({ side: 'target', expected: revTarget, current: targetMetaNow.revision });
+    }
+    if (stale0.length) {
+      return {
+        status: 409,
+        payload: {
+          error: 'STALE_DRAFT_REVISION',
+          message: `预演后${stale0.map((s) => (s.side === 'source' ? '来源' : '目标')).join('或')}草案已变化，本次确认基于旧预演，移植未执行；请重新预演后再确认。`,
+          stale: stale0,
+          source_revision: sourceMetaNow ? sourceMetaNow.revision : null,
+          target_revision: targetMetaNow.revision,
+        },
+      };
+    }
+
+    const ctx = loadPortContext(draftId, body);
+    if (ctx.error) return ctx.error;
+    const { baseline, sourceMeta, targetMeta, sourceState, targetState, sourceMoved, targetMoved, selected } = ctx;
+
+    const plan = planPort({
+      baseline,
+      source: sourceState,
+      target: targetState,
+      selectedKeys: selected,
+      sourceMoved,
+      targetMoved,
+    });
+    if (plan.conflicts.length) {
+      return {
+        status: 409,
+        payload: {
+          error: 'PORT_CONFLICT',
+          message: '移植被拒绝：所选条款在目标草案上存在不同改动，请逐条解决冲突后重新预演；目标草案与来源草案均保持原样。',
+          ...buildPortPayload({
+            targetId: draftId, sourceMeta, targetMeta, plan,
+            beforeState: targetState, projected: plan.projected, projectedMoved: plan.projectedMoved,
+          }),
+        },
+      };
+    }
+    if (plan.new_dangling.length) {
+      return {
+        status: 409,
+        payload: {
+          error: 'PORT_DANGLING',
+          message: '移植被拒绝：移植会在目标草案中新产生悬空引用（系统不会自动移入引用目标）；请补选相关条款或调整引用后重新预演。',
+          ...buildPortPayload({
+            targetId: draftId, sourceMeta, targetMeta, plan,
+            beforeState: targetState, projected: plan.projected, projectedMoved: plan.projectedMoved,
+          }),
+        },
+      };
+    }
+    if (!plan.applied_keys.length) {
+      return {
+        status: 400,
+        payload: {
+          error: 'NO_CHANGES_TO_APPLY',
+          message: '所选改动在目标草案中已全部收敛为相同内容，无需移植；目标草案未改动。',
+          ...buildPortPayload({
+            targetId: draftId, sourceMeta, targetMeta, plan,
+            beforeState: targetState, projected: plan.projected, projectedMoved: plan.projectedMoved,
+          }),
+        },
+      };
+    }
+
+    const projected = plan.projected;
+    const projectedMoved = plan.projectedMoved;
+    const keyListText = plan.applied_keys.join('、');
+    const summary = `从草案「${sourceMeta.name}」移植 ${plan.applied_keys.length} 个条款改动（${keyListText}）`;
+    const detail = {
+      source_draft_id: sourceMeta.id,
+      source_draft_name: sourceMeta.name,
+      source_revision: revSource,
+      clause_keys: selected,
+      applied_keys: plan.applied_keys,
+      converged_keys: plan.converged_keys,
+    };
+
+    // 同一原子操作：目标旧发布预览凭据失效；历史记录一条可撤销移植操作（含完整快照）。
+    supersedePreviewTokens(db, draftId);
+    const { seq } = appendDraftOperation(db, {
+      draftId,
+      kind: 'clause-port',
+      summary,
+      detail,
+      name: targetMeta.name,
+      state: projected,
+      movedSet: projectedMoved,
+    });
+
+    const payload = buildPortPayload({
+      targetId: draftId,
+      sourceMeta,
+      targetMeta: getDraftMeta(db, draftId),
+      plan,
+      beforeState: targetState,
+      projected,
+      projectedMoved,
+    });
+    return {
+      status: 200,
+      payload: {
+        ok: true,
+        applied: true,
+        history_seq: seq,
+        operation_summary: summary,
+        ...payload,
+      },
+    };
+  });
+}
+
 function draftRoutes(method, url, body, query) {
   const draftMatch = url.match(/^\/api\/drafts\/(\d+)(\/.*)?$/);
   if (!draftMatch) return null;
@@ -653,6 +1018,9 @@ function draftRoutes(method, url, body, query) {
 
   if (method === 'GET' && sub === '/history') return handleDraftHistory(draftId);
   if (method === 'GET' && sub === '/impact') return handleDraftImpact(draftId);
+  if (method === 'GET' && sub === '/port-sources') return handlePortSources(draftId);
+  if (method === 'POST' && sub === '/port-preview') return handlePortPreview(draftId, body);
+  if (method === 'POST' && sub === '/port-confirm') return handlePortConfirm(draftId, body);
   if (method === 'POST' && sub === '/undo') return handleUndoRedo(draftId, body, 'undo');
   if (method === 'POST' && sub === '/redo') return handleUndoRedo(draftId, body, 'redo');
 

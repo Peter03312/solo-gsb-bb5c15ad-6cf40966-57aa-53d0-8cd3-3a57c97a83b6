@@ -311,3 +311,9 @@ del { background: #f7c9c2; text-decoration: line-through; border-radius: 3px; }
 .history-row.future { opacity: 0.55; }
 .history-seq { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12.5px; min-width: 34px; }
 .history-summary { flex: 1; }
+
+/* 跨草案移植 */
+.port-check-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 4px; }
+.port-check { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 16px; cursor: pointer; background: #fff; }
+.port-check:hover { border-color: var(--brand); }
+.port-check input { margin: 0; }
